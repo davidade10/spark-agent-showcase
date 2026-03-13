@@ -1,0 +1,26 @@
+Analyze the following approved Iron Condor candidate and generate a structured Trade Card.
+
+--- TRADE DATA ---
+Symbol: {symbol}
+Underlying Price: {underlying_price}
+Expiry: {expiry}
+Days to Expiration (DTE): {dte}
+
+Short Put:  {short_put_strike}  (Δ {short_put_delta})
+Long Put:   {long_put_strike}   (Δ {long_put_delta})
+Short Call: {short_call_strike} (Δ {short_call_delta})
+Long Call:  {long_call_strike}  (Δ {long_call_delta})
+
+Net Credit (per spread): {net_credit}
+Max Loss (per spread):   {max_loss}
+Spread Width:            {width}
+
+Score: {score}/100
+Score Breakdown:
+{score_breakdown}
+
+Context:
+{retrieval_context}
+------------------
+
+Return ONLY a valid JSON object matching the schema in your system prompt.

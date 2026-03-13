@@ -2,3 +2,8 @@
 .env
 __pycache__/
 token.json
+pgdata/
+*.log
+.DS_Store
+llm_layer/circuit_breaker_state.json
+node_modules/

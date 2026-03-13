@@ -4,4 +4,23 @@ version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.12"
-dependencies = []
+dependencies = [
+    "asyncpg>=0.31.0",
+    "fastapi>=0.135.1",
+    "httpx>=0.28.1",
+    "loguru>=0.7.3",
+    "numpy>=2.4.2",
+    "ollama>=0.6.1",
+    "pandas>=3.0.1",
+    "pandas-market-calendars>=5.3.1",
+    "psycopg2-binary>=2.9.11",
+    "py-vollib>=1.0.1",
+    "pydantic>=2.12.5",
+    "python-dotenv>=1.2.2",
+    "pytz>=2026.1.post1",
+    "requests>=2.32.5",
+    "schedule>=1.2.2",
+    "schwab-py>=1.5.1",
+    "sqlalchemy>=2.0.48",
+    "uvicorn>=0.41.0",
+]
