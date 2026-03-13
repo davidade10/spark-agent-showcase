@@ -35,8 +35,8 @@ DB_URL = f"postgresql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
 # GET /accounts — used in POST /accounts/{accountHash}/orders.
 # NOT the visible account number shown in the Schwab UI.
 SCHWAB_ACCOUNT_HASH = os.getenv("SCHWAB_ACCOUNT_HASH", "")
-PAPER_ACCOUNT_NAV   = float(os.getenv("PAPER_ACCOUNT_NAV", "6621"))
-LIVE_ACCOUNT_NAV    = float(os.getenv("LIVE_ACCOUNT_NAV",  "8192"))
+PAPER_ACCOUNT_NAV   = float(os.getenv("PAPER_ACCOUNT_NAV", "20000"))
+LIVE_ACCOUNT_NAV    = float(os.getenv("LIVE_ACCOUNT_NAV",  "14836"))
 
 # ── Safety check — always visible in logs ────────────────────────────────────
 if TRADING_MODE == "live":
