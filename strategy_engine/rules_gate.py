@@ -15,6 +15,7 @@ Rules enforced (in order of check):
   7. FOMC proximity            — no new positions within 2 days of FOMC
   8. Underlying volume         — underlying ADV must be ≥ 1,000,000 shares
   9. Daily loss kill switch    — block all new positions if account down ≥ 3% today
+ 10. Open interest             — both short strikes must have OI ≥ 100; block if unverifiable
 
 Candidates that pass all rules → gate_result = "approved"
 Candidates that fail any rule → gate_result = "blocked" + blocking_rule recorded
@@ -336,6 +337,87 @@ def _check_underlying_volume(
     return None
 
 
+def _get_short_strike_oi(
+    conn,
+    scored: ScoredCandidate,
+) -> tuple[Optional[int], Optional[int]]:
+    """
+    Looks up open interest for the short put and short call strikes
+    from option_quotes. Returns (put_oi, call_oi); either value is None
+    if the row cannot be found or OI is NULL.
+    """
+    c = scored.candidate
+
+    row_put = conn.execute(text("""
+        SELECT open_interest FROM option_quotes
+        WHERE symbol      = :symbol
+          AND snapshot_id = :snapshot_id
+          AND expiry      = :expiry
+          AND strike      = :strike
+          AND option_right = 'P'
+        LIMIT 1
+    """), {
+        "symbol":      c.symbol,
+        "snapshot_id": c.snapshot_id,
+        "expiry":      c.expiry,
+        "strike":      c.short_put_strike,
+    }).fetchone()
+
+    row_call = conn.execute(text("""
+        SELECT open_interest FROM option_quotes
+        WHERE symbol      = :symbol
+          AND snapshot_id = :snapshot_id
+          AND expiry      = :expiry
+          AND strike      = :strike
+          AND option_right = 'C'
+        LIMIT 1
+    """), {
+        "symbol":      c.symbol,
+        "snapshot_id": c.snapshot_id,
+        "expiry":      c.expiry,
+        "strike":      c.short_call_strike,
+    }).fetchone()
+
+    put_oi  = int(row_put.open_interest)  if row_put  and row_put.open_interest  is not None else None
+    call_oi = int(row_call.open_interest) if row_call and row_call.open_interest is not None else None
+
+    return put_oi, call_oi
+
+
+def _check_open_interest(scored: ScoredCandidate, conn) -> Optional[str]:
+    """
+    Both short strikes must have open_interest >= min_short_strike_oi.
+    Blocks (does not skip) if OI data cannot be found — illiquid strikes
+    are a real risk and an unverifiable OI should not pass silently.
+    """
+    min_oi = HARD_RULES["min_short_strike_oi"]
+    c      = scored.candidate
+
+    put_oi, call_oi = _get_short_strike_oi(conn, scored)
+
+    if put_oi is None:
+        return (
+            f"Cannot verify OI for short put "
+            f"${c.short_put_strike:.0f}P {c.expiry} — blocking"
+        )
+    if call_oi is None:
+        return (
+            f"Cannot verify OI for short call "
+            f"${c.short_call_strike:.0f}C {c.expiry} — blocking"
+        )
+    if put_oi < min_oi:
+        return (
+            f"Short put ${c.short_put_strike:.0f}P OI={put_oi} "
+            f"below minimum {min_oi}"
+        )
+    if call_oi < min_oi:
+        return (
+            f"Short call ${c.short_call_strike:.0f}C OI={call_oi} "
+            f"below minimum {min_oi}"
+        )
+    return None
+
+
 def _check_daily_loss_kill(ctx: AccountContext) -> Optional[str]:
     if ctx.daily_pnl_pct <= -HARD_RULES["daily_loss_kill_pct"]:
         return (
@@ -468,6 +550,7 @@ def run_gate(
                     ("position_risk",      lambda: _check_position_risk(scored, ctx)),
                     ("correlated_risk",    lambda: _check_correlated_risk(scored, ctx)),
                     ("underlying_volume",  lambda: _check_underlying_volume(scored, client)),
+                    ("open_interest",      lambda: _check_open_interest(scored, conn)),
                 ]
 
                 for rule_name, check_fn in checks:
