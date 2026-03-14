@@ -269,19 +269,23 @@ def get_exit_signals():
     engine = get_engine()
     with engine.connect() as conn:
         rows = conn.execute(text("""
-            SELECT id, created_at, account_id, symbol, expiry, dte,
-                   reason, credit_received, debit_to_close,
-                   pnl_dollars, pnl_pct, status, meta, position_key
+            SELECT id, created_at, symbol, expiry, dte,
+                   reason, severity, message,
+                   credit_received, debit_to_close, mark,
+                   pnl_dollars, pnl_pct, status, position_id
             FROM exit_signals
-            WHERE status IN ('new', 'snoozed')
-              AND (status != 'snoozed' OR
-                   (meta->>'snooze_until')::timestamptz < now())
-            ORDER BY created_at DESC
+            WHERE status IN ('pending', 'acknowledged')
+            ORDER BY
+                CASE severity
+                    WHEN 'critical' THEN 1
+                    WHEN 'warning'  THEN 2
+                    ELSE 3
+                END,
+                created_at DESC
         """)).fetchall()
     results = []
     for r in rows:
         d = _serialize(r)
-        d["meta"] = _parse_jsonb(d.get("meta"))
         d["age_minutes"] = _age_minutes(d.get("created_at"))
         results.append(d)
     return {"signals": results}
@@ -290,19 +294,20 @@ def get_exit_signals():
 @app.post("/exit-signals/{signal_id}/snooze")
 def snooze_signal(signal_id: int, body: SnoozeRequest = SnoozeRequest()):
     engine = get_engine()
+    snooze_until = datetime.now(timezone.utc) + timedelta(hours=body.hours)
     with engine.begin() as conn:
         row = conn.execute(text(
-            "SELECT id, meta FROM exit_signals WHERE id = :id"
+            "SELECT id FROM exit_signals WHERE id = :id"
         ), {"id": signal_id}).fetchone()
         if not row:
             raise HTTPException(status_code=404, detail="Signal not found")
-        meta = _parse_jsonb(row.meta)
-        meta["snooze_until"] = (datetime.now(timezone.utc) + timedelta(hours=body.hours)).isoformat()
         conn.execute(text("""
             UPDATE exit_signals
-            SET status = 'snoozed', meta = cast(:meta as jsonb)
+            SET status       = 'snoozed',
+                snoozed_until = :until,
+                updated_at   = NOW()
             WHERE id = :id
-        """), {"id": signal_id, "meta": json.dumps(meta)})
+        """), {"id": signal_id, "until": snooze_until})
     return {"status": "snoozed", "id": signal_id, "hours": body.hours}
 
 
@@ -311,7 +316,9 @@ def dismiss_signal(signal_id: int):
     engine = get_engine()
     with engine.begin() as conn:
         conn.execute(text("""
-            UPDATE exit_signals SET status = 'dismissed' WHERE id = :id
+            UPDATE exit_signals
+            SET status = 'dismissed', updated_at = NOW()
+            WHERE id = :id
         """), {"id": signal_id})
     return {"status": "dismissed", "id": signal_id}
 
@@ -321,7 +328,9 @@ def acknowledge_signal(signal_id: int):
     engine = get_engine()
     with engine.begin() as conn:
         conn.execute(text("""
-            UPDATE exit_signals SET status = 'acknowledged' WHERE id = :id
+            UPDATE exit_signals
+            SET status = 'acknowledged', updated_at = NOW()
+            WHERE id = :id
         """), {"id": signal_id})
     return {"status": "acknowledged", "id": signal_id}
 

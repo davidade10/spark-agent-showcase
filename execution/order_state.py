@@ -133,6 +133,19 @@ def migrate_orders_schema(engine) -> None:
         ("last_seen_in_schwab",  "TIMESTAMPTZ"),         # last confirmed-live timestamp
         # Strategy generalisation (non-condor positions)
         ("legs_json",            "JSONB"),               # raw leg data for non-standard strategies
+        # Exit monitor — live mark price
+        ("mark",                 "NUMERIC"),             # current spread mid-price
+        ("mark_updated_at",      "TIMESTAMPTZ"),         # when mark was last computed
+    ]
+
+    # exit_signals — new columns added to potentially-existing table
+    _exit_signals_add: list[tuple[str, str]] = [
+        ("position_id",    "INTEGER"),
+        ("severity",       "TEXT DEFAULT 'info'"),
+        ("mark",           "NUMERIC"),
+        ("message",        "TEXT"),
+        ("snoozed_until",  "TIMESTAMPTZ"),
+        ("updated_at",     "TIMESTAMPTZ DEFAULT now()"),
     ]
 
     # Legacy NOT NULL columns that conflict with Phase 5 writes.
@@ -179,6 +192,36 @@ def migrate_orders_schema(engine) -> None:
                 conn.execute(text(
                     f"ALTER TABLE {table} ALTER COLUMN {col} {action}"
                 ))
+
+        # exit_signals — one row per triggered exit condition per position.
+        # Uses status: 'pending' | 'acknowledged' | 'snoozed' | 'dismissed'
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS exit_signals (
+                id              SERIAL PRIMARY KEY,
+                position_id     INTEGER REFERENCES positions(id),
+                symbol          TEXT,
+                expiry          DATE,
+                dte             INTEGER,
+                reason          TEXT,
+                severity        TEXT        DEFAULT 'info',
+                pnl_pct         NUMERIC,
+                pnl_dollars     NUMERIC,
+                credit_received NUMERIC,
+                debit_to_close  NUMERIC,
+                mark            NUMERIC,
+                message         TEXT,
+                status          TEXT        DEFAULT 'pending',
+                snoozed_until   TIMESTAMPTZ,
+                created_at      TIMESTAMPTZ DEFAULT now(),
+                updated_at      TIMESTAMPTZ DEFAULT now()
+            )
+        """))
+
+        # Migrate existing exit_signals rows (table may pre-date this schema)
+        for col, coltype in _exit_signals_add:
+            conn.execute(text(
+                f"ALTER TABLE exit_signals ADD COLUMN IF NOT EXISTS {col} {coltype}"
+            ))
 
         # reconciler_state — key/value store for run counter and future flags.
         conn.execute(text("""

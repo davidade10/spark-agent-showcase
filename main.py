@@ -26,15 +26,16 @@ import schedule
 import pandas_market_calendars as mcal
 from apscheduler.schedulers.background import BackgroundScheduler
 
-from data_layer.collector       import run_collection_cycle, WATCHLIST
-from data_layer.freshness       import run_health_check
-from data_layer.iv_rank         import run_iv_rank_computation
-from data_layer.provider        import get_schwab_client
-from data_layer.reconciler      import run_scheduled_reconciliation
-from strategy_engine.candidates import scan_for_candidates
-from strategy_engine.scoring    import score_candidates
-from strategy_engine.rules_gate import run_gate as run_rules_gate
-from llm_layer.trade_card       import generate_one
+from data_layer.collector           import run_collection_cycle, WATCHLIST
+from data_layer.freshness           import run_health_check
+from data_layer.iv_rank             import run_iv_rank_computation
+from data_layer.provider            import get_schwab_client
+from data_layer.reconciler          import run_scheduled_reconciliation
+from strategy_engine.candidates     import scan_for_candidates
+from strategy_engine.exit_monitor   import run_exit_scan
+from strategy_engine.scoring        import score_candidates
+from strategy_engine.rules_gate     import run_gate as run_rules_gate
+from llm_layer.trade_card           import generate_one
 
 # ── Logging setup ─────────────────────────────────────────────────────────────
 pathlib.Path("logs").mkdir(exist_ok=True)
@@ -151,6 +152,17 @@ def job_collect(client) -> None:
             generate_one()
         except Exception as e:
             logger.error(f"LLM card generation crashed — {e}")
+
+    # ── Exit signal scan ──────────────────────────────────────────────────────
+    logger.info("── Running exit signal scan ───────────────────")
+    try:
+        new_signals = run_exit_scan()
+        if new_signals:
+            logger.info(f"Exit scan: {len(new_signals)} new signal(s) generated")
+        else:
+            logger.info("Exit scan: no new signals")
+    except Exception as e:
+        logger.error(f"Exit signal scan crashed — {e}")
 
 
 def job_health_check() -> None:
