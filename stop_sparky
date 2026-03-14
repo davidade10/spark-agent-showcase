@@ -1,0 +1,42 @@
+#!/bin/bash
+set -euo pipefail
+echo "🛑 Shutting down Sparky..."
+
+# Helper: get PIDs listening on a port (macOS-compatible)
+get_pids_for_port() {
+    local port=$1
+    local pids
+    pids=$(lsof -ti:"$port" 2>/dev/null) || \
+    pids=$(lsof -i tcp:"$port" -sTCP:LISTEN -t 2>/dev/null) || \
+    pids=""
+    echo "$pids"
+}
+
+# Kill by port
+for port in 8000 3000; do
+    pids=$(get_pids_for_port "$port")
+    if [ -n "$pids" ]; then
+        echo "  Stopping port $port (PIDs: $pids)"
+        echo "$pids" | xargs kill -9 2>/dev/null || true
+    fi
+done
+
+# Kill agent loop by process name
+pkill -f "python.*main.py" 2>/dev/null || true
+
+# Verify
+sleep 1
+STILL_RUNNING=0
+for port in 8000 3000; do
+    pids=$(get_pids_for_port "$port")
+    if [ -n "$pids" ]; then
+        echo "  ⚠️  Port $port still occupied (PIDs: $pids)"
+        STILL_RUNNING=1
+    fi
+done
+
+if [ $STILL_RUNNING -eq 0 ]; then
+    echo "✅ All Sparky services stopped."
+else
+    echo "⚠️  Some processes may still be running. Try: sudo kill -9 <PID>"
+fi

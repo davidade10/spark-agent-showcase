@@ -49,7 +49,9 @@ logger = logging.getLogger(__name__)
 
 DB_URL = f"postgresql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
 
-LOG_FILE = Path(__file__).parent.parent / "reconciler.log"
+PROJECT_ROOT   = Path(__file__).resolve().parent.parent
+RECONCILER_LOG = PROJECT_ROOT / "logs" / "reconciler.log"
+RECONCILER_LOG.parent.mkdir(parents=True, exist_ok=True)
 
 # ── Date normalisation helper ─────────────────────────────────────────────────
 
@@ -978,7 +980,7 @@ def run_scheduled_reconciliation() -> None:
 
     # Append to reconciler.log
     try:
-        with open(LOG_FILE, "a") as f:
+        with open(RECONCILER_LOG, "a") as f:
             f.write(json.dumps(full_summary, default=str) + "\n")
     except Exception as e:
         logger.warning(f"Could not write to reconciler.log — {e}")

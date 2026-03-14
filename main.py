@@ -2,10 +2,12 @@
 main.py — Scheduler / Orchestrator
 The entry point that runs the entire spark-agent system.
 
-Three jobs:
+Jobs:
   1. Every 15 min during market hours → run_collection_cycle()
   2. Every 15 min always             → run_health_check()
   3. Daily at 4:30 PM ET             → run_nightly_iv_rank()
+  4. Every 30 min during market hours (9:05, 9:35 … 15:35 ET) → run_scheduled_reconciliation()
+  5. End of day Mon–Fri at 4:05 PM ET                          → run_scheduled_reconciliation()
 
 Run with:
   python main.py
@@ -15,29 +17,33 @@ Ctrl+C to stop.
 """
 
 import logging
+import pathlib
 import time
 from datetime import datetime, timezone
 
 import pytz
 import schedule
 import pandas_market_calendars as mcal
+from apscheduler.schedulers.background import BackgroundScheduler
 
 from data_layer.collector       import run_collection_cycle, WATCHLIST
 from data_layer.freshness       import run_health_check
 from data_layer.iv_rank         import run_iv_rank_computation
 from data_layer.provider        import get_schwab_client
+from data_layer.reconciler      import run_scheduled_reconciliation
 from strategy_engine.candidates import scan_for_candidates
 from strategy_engine.scoring    import score_candidates
 from strategy_engine.rules_gate import run_gate as run_rules_gate
 from llm_layer.trade_card       import generate_one
 
 # ── Logging setup ─────────────────────────────────────────────────────────────
+pathlib.Path("logs").mkdir(exist_ok=True)
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(name)s — %(message)s",
     handlers=[
-        logging.StreamHandler(),                        # print to terminal
-        logging.FileHandler("spark_agent.log"),         # write to log file
+        logging.StreamHandler(),                          # print to terminal
+        logging.FileHandler("logs/agent.log"),            # write to log file
     ],
 )
 logger = logging.getLogger(__name__)
@@ -174,6 +180,17 @@ def job_iv_rank() -> None:
         logger.error(f"IV rank job crashed — {e}")
 
 
+def job_reconciler() -> None:
+    """
+    Job 4 — runs on APScheduler cron (every 30 min during market hours + EOD 4:05 PM ET).
+    Syncs Schwab positions to DB and appends NAV summary to reconciler.log.
+    """
+    try:
+        run_scheduled_reconciliation()
+    except Exception as e:
+        logger.error(f"Reconciler job crashed — {e}")
+
+
 # ── Main Entry Point ──────────────────────────────────────────────────────────
 def main():
     logger.info("=" * 60)
@@ -203,10 +220,35 @@ def main():
     # IV rank: daily at 4:30 PM ET (30 min after market close)
     schedule.every().day.at("16:30").do(job_iv_rank)
 
+    # Reconciler: APScheduler cron (timezone-aware)
+    recon_tz = "America/New_York"
+    recon_scheduler = BackgroundScheduler(timezone=recon_tz)
+    recon_scheduler.add_job(
+        job_reconciler,
+        trigger="cron",
+        day_of_week="mon-fri",
+        hour="9-15",
+        minute="5,35",
+        timezone=recon_tz,
+        id="reconciler_market_hours",
+    )
+    recon_scheduler.add_job(
+        job_reconciler,
+        trigger="cron",
+        day_of_week="mon-fri",
+        hour="16",
+        minute="5",
+        timezone=recon_tz,
+        id="reconciler_eod",
+    )
+    recon_scheduler.start()
+    logger.info("Reconciler scheduler started (9:05–15:35 ET every 30 min + 16:05 ET EOD)")
+
     logger.info("Schedule configured:")
     logger.info("  Collection  → every 15 minutes (market hours only)")
     logger.info("  Health check→ every 15 minutes (always)")
     logger.info("  IV rank     → daily at 4:30 PM ET")
+    logger.info("  Reconciler → cron 9:05–15:35 ET every 30 min, + 16:05 ET EOD (Mon–Fri)")
     logger.info("")
     logger.info("Running first cycle immediately...")
 

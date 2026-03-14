@@ -7,3 +7,4 @@ pgdata/
 .DS_Store
 llm_layer/circuit_breaker_state.json
 node_modules/
+logs/

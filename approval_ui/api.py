@@ -328,8 +328,8 @@ def acknowledge_signal(signal_id: int):
 
 # ── NAV (reconciler log) ───────────────────────────────────────────────────────
 
-# Project root: approval_ui/api.py -> parent.parent
-RECONCILER_LOG = (Path(__file__).resolve().parent.parent / "reconciler.log")
+PROJECT_ROOT   = Path(__file__).resolve().parent.parent
+RECONCILER_LOG = PROJECT_ROOT / "logs" / "reconciler.log"
 
 
 @app.get("/nav")
@@ -456,9 +456,18 @@ def get_events(symbol: str):
 def get_health():
     health: dict[str, Any] = {}
 
+    # DB connectivity
+    try:
+        engine = get_engine()
+        with engine.connect() as conn:
+            conn.execute(text("SELECT 1"))
+        health["database"] = "ok"
+    except Exception as e:
+        health["database"] = f"error: {e}"
+
     # Circuit breaker
     try:
-        cb_path = Path("llm_layer/circuit_breaker_state.json")
+        cb_path = PROJECT_ROOT / "llm_layer" / "circuit_breaker_state.json"
         if cb_path.exists():
             cb = json.loads(cb_path.read_text())
             health["circuit_breaker"] = {
@@ -471,30 +480,31 @@ def get_health():
     except Exception as e:
         health["circuit_breaker"] = {"state": "error", "detail": str(e)}
 
-    # Data freshness
-    try:
-        engine = get_engine()
-        with engine.connect() as conn:
-            row = conn.execute(text("""
-                SELECT ts FROM snapshot_runs
-                WHERE status IN ('ok','partial')
-                ORDER BY ts DESC LIMIT 1
-            """)).fetchone()
-        if row:
-            age = _age_minutes(row.ts)
-            health["data_freshness"] = {
-                "last_snapshot_minutes_ago": age,
-                "is_stale": age > 20,
-            }
-        else:
-            health["data_freshness"] = {"last_snapshot_minutes_ago": None, "is_stale": True}
-    except Exception as e:
-        health["data_freshness"] = {"error": str(e)}
+    # Data freshness (requires DB — skip if DB is down)
+    if health.get("database") == "ok":
+        try:
+            with get_engine().connect() as conn:
+                row = conn.execute(text("""
+                    SELECT ts FROM snapshot_runs
+                    WHERE status IN ('ok','partial')
+                    ORDER BY ts DESC LIMIT 1
+                """)).fetchone()
+            if row:
+                age = _age_minutes(row.ts)
+                health["data_freshness"] = {
+                    "last_snapshot_minutes_ago": age,
+                    "is_stale": age > 20,
+                }
+            else:
+                health["data_freshness"] = {"last_snapshot_minutes_ago": None, "is_stale": True}
+        except Exception as e:
+            health["data_freshness"] = {"error": str(e)}
 
-    # Token
+    # Schwab token
     try:
-        token_path = Path("token.json")
+        token_path = PROJECT_ROOT / "token.json"
         if token_path.exists():
+            health["token"] = "present"
             token = json.loads(token_path.read_text())
             expires_at = token.get("expires_at") or token.get("expiry")
             if expires_at:
@@ -505,7 +515,23 @@ def get_health():
                     "days_remaining": round(days_left, 1),
                     "expires_at": exp_dt.isoformat(),
                 }
+        else:
+            health["token"] = "missing"
     except Exception as e:
-        health["token"] = {"error": str(e)}
+        health["token"] = f"error: {e}"
 
-    return health
+    # Reconciler log freshness
+    try:
+        if RECONCILER_LOG.exists():
+            import time as _time
+            age_seconds = _time.time() - RECONCILER_LOG.stat().st_mtime
+            health["reconciler_log"] = f"ok ({age_seconds:.0f}s old)"
+        else:
+            health["reconciler_log"] = "missing"
+    except Exception as e:
+        health["reconciler_log"] = f"error: {e}"
+
+    return {
+        "status": "healthy" if health.get("database") == "ok" else "degraded",
+        "checks": health,
+    }

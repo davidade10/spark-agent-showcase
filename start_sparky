@@ -1,0 +1,91 @@
+#!/bin/bash
+set -euo pipefail
+cd "$(dirname "$0")"
+
+# ── Pre-flight checks ──────────────────────────────────────────────────────────
+echo "🔍 Running pre-flight checks..."
+
+# Check Docker is running
+if ! docker info > /dev/null 2>&1; then
+    echo "❌ Docker is not running. Start Docker Desktop first."
+    exit 1
+fi
+
+# Check TimescaleDB container is running
+if ! docker ps --format '{{.Names}}' | grep -q timescaledb; then
+    echo "⚠️  TimescaleDB container not running. Starting it..."
+    docker start timescaledb || { echo "❌ Failed to start TimescaleDB"; exit 1; }
+    sleep 2
+fi
+
+# Check TimescaleDB is accepting connections
+if ! docker exec timescaledb pg_isready -U postgres > /dev/null 2>&1; then
+    echo "❌ TimescaleDB is not accepting connections."
+    exit 1
+fi
+
+# Check .env exists
+if [ ! -f .env ]; then
+    echo "❌ .env file not found in $(pwd)"
+    exit 1
+fi
+
+# Check token.json exists
+if [ ! -f token.json ]; then
+    echo "❌ token.json not found — run: python -m data_layer.provider"
+    exit 1
+fi
+
+# ── Kill stale processes ───────────────────────────────────────────────────────
+echo "🧹 Cleaning up stale processes..."
+lsof -ti:8000 2>/dev/null | xargs kill -9 2>/dev/null || true
+lsof -ti:3000 2>/dev/null | xargs kill -9 2>/dev/null || true
+
+# ── Create log directory with correct ownership ────────────────────────────────
+LOG_DIR="$(pwd)/logs"
+mkdir -p "$LOG_DIR"
+
+# Touch all log files BEFORE backgrounding any process.
+# This ensures the current user owns them, not a subprocess.
+for f in agent.log backend.log frontend.log reconciler.log; do
+    touch "$LOG_DIR/$f"
+done
+
+# ── Start services ─────────────────────────────────────────────────────────────
+echo "🚀 Booting Sparky Quant Desk..."
+
+echo "  Starting Backend API (port 8000)..."
+nohup uv run uvicorn approval_ui.api:app --reload --port 8000 \
+    >> "$LOG_DIR/backend.log" 2>&1 &
+
+echo "  Starting Frontend UI (port 3000)..."
+cd approval_ui/web
+nohup npm run dev >> "$LOG_DIR/frontend.log" 2>&1 &
+cd ../..
+
+echo "  Starting Autonomous Agent Loop..."
+nohup uv run python main.py >> "$LOG_DIR/agent.log" 2>&1 &
+
+# ── Wait briefly and verify ────────────────────────────────────────────────────
+sleep 3
+
+FAILED=0
+if ! lsof -ti:8000 > /dev/null 2>&1; then
+    echo "  ❌ Backend failed to start — check $LOG_DIR/backend.log"
+    FAILED=1
+fi
+if ! lsof -ti:3000 > /dev/null 2>&1; then
+    echo "  ❌ Frontend failed to start — check $LOG_DIR/frontend.log"
+    FAILED=1
+fi
+
+if [ $FAILED -eq 0 ]; then
+    echo ""
+    echo "✅ Sparky is live!"
+    echo "📊 Dashboard: http://localhost:3000"
+    echo "📂 Logs: $LOG_DIR/"
+    echo "🛑 Shutdown: ./stop_sparky"
+else
+    echo ""
+    echo "⚠️  Some services failed to start. Check logs above."
+fi
