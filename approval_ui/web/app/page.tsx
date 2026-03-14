@@ -910,6 +910,47 @@ export default function Dashboard() {
     return getFreshnessLevel(dataAgeSeconds / 60);
   }, [dataAgeSeconds]);
 
+  // ── Utility rail derived data ─────────────────────────────────────────────
+
+  const portfolioHealth = useMemo(() => {
+    const hasCreditData = positions.some(
+      p => (p.fill_credit ?? p.entry_credit) != null && p.qty != null
+    );
+    const totalCredit = hasCreditData
+      ? positions.reduce((sum, p) => {
+          const credit = p.fill_credit ?? p.entry_credit;
+          return credit != null && p.qty != null ? sum + credit * p.qty * 100 : sum;
+        }, 0)
+      : null;
+    const expiryClusters = positions.reduce((acc, p) => {
+      if (p.expiry) acc[p.expiry] = (acc[p.expiry] ?? 0) + 1;
+      return acc;
+    }, {} as Record<string, number>);
+    const sortedExpiries = Object.entries(expiryClusters).sort(([a], [b]) => a.localeCompare(b));
+    const maxCount = sortedExpiries.length > 0 ? Math.max(...sortedExpiries.map(([, c]) => c)) : 0;
+    const expiryConcentration = positions.length > 0 && maxCount / positions.length > 0.5;
+    const uniqueSymbols = [...new Set(positions.map(p => p.symbol))].sort();
+    return { totalCredit, sortedExpiries, expiryConcentration, uniqueSymbols };
+  }, [positions]);
+
+  const railAlerts = useMemo(() => {
+    const list: { severity: "red" | "amber" | "green" | "gray"; msg: string }[] = [];
+    if (systemLevel === "stale")
+      list.push({ severity: "amber", msg: "Data stale · refresh before acting" });
+    if (health != null && health.circuit_breaker?.state !== "closed")
+      list.push({ severity: "red", msg: "LLM circuit breaker tripped" });
+    if (health?.token?.valid === false)
+      list.push({ severity: "red", msg: "Schwab token expired — renew now" });
+    signals.slice(0, 3).forEach(s =>
+      list.push({ severity: "green", msg: `Exit signal: ${s.symbol}` })
+    );
+    if (candidates.length === 0 && positions.length === 0)
+      list.push({ severity: "gray", msg: "No active candidates or positions" });
+    const order: Record<string, number> = { red: 0, amber: 1, green: 2, gray: 3 };
+    list.sort((a, b) => order[a.severity] - order[b.severity]);
+    return list.slice(0, 5);
+  }, [systemLevel, health, signals, candidates, positions]);
+
   const fetchAll = useCallback(async () => {
     setPolling(true);
     try {
@@ -990,83 +1031,226 @@ export default function Dashboard() {
         </div>
       )}
 
-      <div className="max-w-6xl mx-auto px-6 py-6">
+      {/* Two-column layout: main content + utility rail */}
+      <div className="flex flex-col xl:flex-row gap-6 p-6 items-start">
 
-        {/* NAV Dashboard */}
-        {accounts.length > 0 && <NavDashboard accounts={accounts} />}
+        {/* ── Left column — main content ──────────────────────────────────── */}
+        <div className="flex-1 min-w-0">
 
-        {/* Change 7: Tab bar — 13px font, accent active border, badge counts, tab-btn hover */}
-        <div className="flex gap-1 mb-6 border-b border-subtle pb-px">
-          {([
-            ["candidates", "Pending",      candidates.length],
-            ["positions",  "Positions",    positions.length],
-            ["exits",      "Exit Signals", signals.length],
-          ] as const).map(([key, label, count]) => {
-            const isActive   = tab === key;
-            const hasUrgent  = key === "exits" && signals.length > 0 && !isActive;
-            return (
-              <button
-                key={key}
-                onClick={() => setTab(key)}
-                className={`tab-btn px-5 py-2.5 text-[13px] font-mono font-medium transition-all border-b-2 flex items-center gap-2 ${
-                  isActive
-                    ? "text-accent border-accent bg-accent/5"
-                    : hasUrgent
-                      ? "text-warning border-transparent"
-                      : "text-secondary border-transparent"
-                }`}
-              >
-                {label}
-                {count > 0 && (
-                  <span className={`text-[10px] px-1.5 py-0.5 rounded-full font-mono ${
-                    isActive      ? "bg-accent/20 text-accent"
-                    : hasUrgent  ? "bg-warning/15 text-warning"
-                    : "bg-white/5 text-tertiary"
-                  }`}>
-                    {count}
-                  </span>
-                )}
-              </button>
-            );
-          })}
+          {/* NAV Dashboard */}
+          {accounts.length > 0 && <NavDashboard accounts={accounts} />}
+
+          {/* Tab bar */}
+          <div className="flex gap-1 mb-6 border-b border-subtle pb-px">
+            {([
+              ["candidates", "Pending",      candidates.length],
+              ["positions",  "Positions",    positions.length],
+              ["exits",      "Exit Signals", signals.length],
+            ] as const).map(([key, label, count]) => {
+              const isActive   = tab === key;
+              const hasUrgent  = key === "exits" && signals.length > 0 && !isActive;
+              return (
+                <button
+                  key={key}
+                  onClick={() => setTab(key)}
+                  className={`tab-btn px-5 py-2.5 text-[13px] font-mono font-medium transition-all border-b-2 flex items-center gap-2 ${
+                    isActive
+                      ? "text-accent border-accent bg-accent/5"
+                      : hasUrgent
+                        ? "text-warning border-transparent"
+                        : "text-secondary border-transparent"
+                  }`}
+                >
+                  {label}
+                  {count > 0 && (
+                    <span className={`text-[10px] px-1.5 py-0.5 rounded-full font-mono ${
+                      isActive      ? "bg-accent/20 text-accent"
+                      : hasUrgent  ? "bg-warning/15 text-warning"
+                      : "bg-white/5 text-tertiary"
+                    }`}>
+                      {count}
+                    </span>
+                  )}
+                </button>
+              );
+            })}
+          </div>
+
+          {/* Tab content */}
+          {tab === "candidates" && (
+            candidates.length === 0 ? (
+              <div className="text-center py-20 border border-dashed border-subtle rounded-xl bg-card/30">
+                <TrendingUp size={32} className="mx-auto mb-3 text-tertiary" />
+                <div className="text-secondary text-lg">No pending trade candidates</div>
+                <div className="text-xs mt-2 text-tertiary font-mono">Polling every 5s · Awaiting strategy engine output</div>
+              </div>
+            ) : (
+              <div className="grid grid-cols-1 xl:grid-cols-2 gap-6">
+                {candidates.map(c => (
+                  <TradeCard key={c.id} candidate={c} freshnessLevel={systemLevel} onApprove={handleApprove} onReject={handleReject} />
+                ))}
+              </div>
+            )
+          )}
+
+          {tab === "positions" && (
+            positions.length === 0 ? (
+              <div className="text-center py-20 border border-dashed border-subtle rounded-xl bg-card/30 font-mono text-sm text-secondary">
+                No open positions found in database.
+              </div>
+            ) : (
+              <div className="space-y-0 max-w-4xl">{positions.map(p => <PositionRow key={p.id} p={p} />)}</div>
+            )
+          )}
+
+          {tab === "exits" && (
+            signals.length === 0 ? (
+              <div className="text-center py-20 border border-dashed border-subtle rounded-xl bg-card/30 font-mono text-sm text-secondary">
+                No pending exit signals triggered.
+              </div>
+            ) : (
+              <div className="space-y-4 max-w-4xl">{signals.map(s => <ExitSignalRow key={s.id} s={s} onAction={handleSignalAction} />)}</div>
+            )
+          )}
         </div>
 
-        {/* Content */}
-        {tab === "candidates" && (
-          candidates.length === 0 ? (
-            <div className="text-center py-20 border border-dashed border-subtle rounded-xl bg-card/30">
-              <TrendingUp size={32} className="mx-auto mb-3 text-tertiary" />
-              <div className="text-secondary text-lg">No pending trade candidates</div>
-              <div className="text-xs mt-2 text-tertiary font-mono">Polling every 5s · Awaiting strategy engine output</div>
+        {/* ── Right column — utility rail ──────────────────────────────────── */}
+        <div className="w-full xl:w-80 xl:shrink-0 space-y-4">
+
+          {/* Panel 1 — Portfolio Health */}
+          <div className="card-surface p-4 font-mono">
+            <div className="text-[10px] text-tertiary tracking-widest mb-3">🛡 PORTFOLIO HEALTH</div>
+            <div className="space-y-2">
+              {([
+                ["Open positions",   positions.length > 0 ? String(positions.length) : "—"],
+                ["Total credit",     portfolioHealth.totalCredit != null ? `$${portfolioHealth.totalCredit.toFixed(2)}` : "—"],
+                ["Net delta",        "—"],
+                ["Theta / day",      "—"],
+                ["Vega",             "—"],
+              ] as [string, string][]).map(([l, v]) => (
+                <div key={l} className="flex justify-between text-xs">
+                  <span className="text-tertiary">{l}</span>
+                  <span className="text-secondary">{v}</span>
+                </div>
+              ))}
+              {portfolioHealth.sortedExpiries.length > 0 && (
+                <div className="pt-2 border-t border-subtle">
+                  <div className="text-[10px] text-tertiary mb-1.5">EXPIRY CLUSTERS</div>
+                  <div className="text-xs text-secondary leading-relaxed">
+                    {portfolioHealth.sortedExpiries.map(([exp, count], i) => (
+                      <span key={exp}>{i > 0 ? " · " : ""}{exp}: {count}</span>
+                    ))}
+                  </div>
+                  {portfolioHealth.expiryConcentration && (
+                    <div className="text-[10px] text-warning mt-1">⚠ Expiry concentration</div>
+                  )}
+                </div>
+              )}
+              {portfolioHealth.uniqueSymbols.length > 0 && (
+                <div className="pt-2 border-t border-subtle">
+                  <div className="text-[10px] text-tertiary mb-1.5">SYMBOLS</div>
+                  <div className="flex flex-wrap gap-1">
+                    {portfolioHealth.uniqueSymbols.map(sym => (
+                      <span key={sym} className="text-[10px] px-1.5 py-0.5 rounded bg-white/5 text-tertiary border border-subtle">{sym}</span>
+                    ))}
+                  </div>
+                </div>
+              )}
             </div>
-          ) : (
-            <div className="grid grid-cols-1 xl:grid-cols-2 gap-6">
-              {candidates.map(c => (
-                <TradeCard key={c.id} candidate={c} freshnessLevel={systemLevel} onApprove={handleApprove} onReject={handleReject} />
+          </div>
+
+          {/* Panel 2 — System Status */}
+          <div className="card-surface p-4 font-mono">
+            <div className="text-[10px] text-tertiary tracking-widest mb-3">⚡ SYSTEM STATUS</div>
+            <div className="space-y-2 mb-4">
+              <div className="flex justify-between items-center text-xs">
+                <span className="text-tertiary">LLM</span>
+                <span className={`flex items-center gap-1 ${health?.circuit_breaker?.state === "closed" ? "text-success" : "text-danger"}`}>
+                  <span className="inline-block w-1.5 h-1.5 rounded-full bg-current" />
+                  {health?.circuit_breaker?.state === "closed" ? "Online" : "Tripped"}
+                </span>
+              </div>
+              <div className="flex justify-between items-center text-xs">
+                <span className="text-tertiary">Data feed</span>
+                <span className={`flex items-center gap-1 ${
+                  systemLevel === "live" ? "text-success" :
+                  systemLevel === "delayed" ? "text-warning" : "text-danger"
+                }`}>
+                  <span className="inline-block w-1.5 h-1.5 rounded-full bg-current" />
+                  {systemLevel.toUpperCase()}
+                </span>
+              </div>
+              <div className="flex justify-between items-center text-xs">
+                <span className="text-tertiary">Token</span>
+                {health?.token?.valid === false ? (
+                  <span className="text-danger">EXPIRED</span>
+                ) : health?.token?.days_remaining != null ? (
+                  <span className="text-success">{health.token.days_remaining}d remaining</span>
+                ) : (
+                  <span className="text-tertiary">—</span>
+                )}
+              </div>
+              <div className="flex justify-between items-center text-xs">
+                <span className="text-tertiary">Agent loop</span>
+                <span className="text-success flex items-center gap-1">
+                  <span className="inline-block w-1.5 h-1.5 rounded-full bg-current" />
+                  Running
+                </span>
+              </div>
+              {(["Last reconcile", "Next reconcile"] as const).map(l => (
+                <div key={l} className="flex justify-between text-xs">
+                  <span className="text-tertiary">{l}</span>
+                  <span className="text-secondary">--</span>
+                </div>
               ))}
             </div>
-          )
-        )}
-
-        {tab === "positions" && (
-          positions.length === 0 ? (
-            <div className="text-center py-20 border border-dashed border-subtle rounded-xl bg-card/30 font-mono text-sm text-secondary">
-              No open positions found in database.
+            <div className="space-y-2 border-t border-subtle pt-3">
+              <button
+                onClick={fetchAll}
+                className="w-full py-2 text-xs font-mono rounded-lg border border-subtle text-secondary hover:text-primary hover:border-focus transition-colors flex items-center justify-center gap-1.5"
+              >
+                ↻ Refresh Prices
+              </button>
+              <button
+                disabled
+                title="Coming soon"
+                className="w-full py-2 text-xs font-mono rounded-lg border border-subtle text-tertiary opacity-40 cursor-not-allowed"
+              >
+                ⟳ Force Reconcile
+              </button>
+              <button
+                disabled
+                title="Coming soon"
+                className="w-full py-2 text-xs font-mono rounded-lg border border-subtle text-tertiary opacity-40 cursor-not-allowed"
+              >
+                ⊞ Rescan Candidates
+              </button>
             </div>
-          ) : (
-            <div className="space-y-0 max-w-4xl">{positions.map(p => <PositionRow key={p.id} p={p} />)}</div>
-          )
-        )}
+          </div>
 
-        {tab === "exits" && (
-          signals.length === 0 ? (
-            <div className="text-center py-20 border border-dashed border-subtle rounded-xl bg-card/30 font-mono text-sm text-secondary">
-              No pending exit signals triggered.
-            </div>
-          ) : (
-            <div className="space-y-4 max-w-4xl">{signals.map(s => <ExitSignalRow key={s.id} s={s} onAction={handleSignalAction} />)}</div>
-          )
-        )}
+          {/* Panel 3 — Alerts Feed */}
+          <div className="card-surface p-4 font-mono">
+            <div className="text-[10px] text-tertiary tracking-widest mb-3">⚡ ALERTS</div>
+            {railAlerts.length === 0 ? (
+              <div className="text-xs text-tertiary">✓ All systems nominal</div>
+            ) : (
+              <div className="space-y-2">
+                {railAlerts.map((a, i) => (
+                  <div key={i} className={`flex items-start gap-2 text-xs ${
+                    a.severity === "red"   ? "text-danger"  :
+                    a.severity === "amber" ? "text-warning" :
+                    a.severity === "green" ? "text-success" : "text-tertiary"
+                  }`}>
+                    <span className="mt-px shrink-0">{a.severity === "gray" ? "○" : "●"}</span>
+                    <span className="flex-1">{a.msg}</span>
+                    <span className="text-tertiary shrink-0">--</span>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+
+        </div>
       </div>
     </div>
   );
