@@ -238,7 +238,7 @@ function AccountCard({ label, accountId, nav, dailyPnl, unrealizedPnl, buyingPow
           <div className="text-[10px] text-tertiary uppercase">{label}</div>
           {accountId && (
             <div className={`text-xs mt-0.5 ${isLive ? "text-info" : "text-secondary"}`}>
-              ···{accountId.slice(-4)}
+              {accountId === "PAPER" ? "PAPER" : `···${accountId.slice(-4)}`}
             </div>
           )}
         </div>
@@ -301,7 +301,7 @@ function AccountCard({ label, accountId, nav, dailyPnl, unrealizedPnl, buyingPow
   );
 }
 
-function NavDashboard({ accounts, liveNav }: { accounts: Account[]; liveNav: number | null }) {
+function NavDashboard({ accounts }: { accounts: Account[] }) {
   const combined = accounts.reduce((acc, a) => ({
     open_positions: acc.open_positions + (a.open_positions ?? 0),
     total_margin:   a.total_margin   != null ? acc.total_margin   + a.total_margin   : acc.total_margin,
@@ -310,9 +310,8 @@ function NavDashboard({ accounts, liveNav }: { accounts: Account[]; liveNav: num
     has_pnl:        acc.has_pnl    || a.total_pnl    != null,
   }), { open_positions: 0, total_margin: 0, total_pnl: 0, has_margin: false, has_pnl: false });
 
-  const paperNav   = accounts.find(a => a.type === "PAPER")?.nav ?? null;
-  const combinedNav = paperNav != null || liveNav != null
-    ? (paperNav ?? 0) + (liveNav ?? 0)
+  const combinedNav = accounts.some(a => a.nav != null)
+    ? accounts.reduce((sum, a) => sum + (a.nav ?? 0), 0)
     : null;
 
   return (
@@ -329,7 +328,7 @@ function NavDashboard({ accounts, liveNav }: { accounts: Account[]; liveNav: num
             key={a.account_id}
             label={a.type || "ACCOUNT"}
             accountId={a.account_id}
-            nav={a.type === "LIVE" ? liveNav : a.nav}
+            nav={a.nav}
             dailyPnl={a.daily_pnl}
             unrealizedPnl={a.total_pnl}
             buyingPower={a.buying_power}
@@ -636,6 +635,16 @@ function TradeCard({ candidate, freshnessLevel, onApprove, onReject }: {
 
 // ── Position Row (Changes 5 + 6) ──────────────────────────────────────────────
 
+const strategyBadge: Record<string, string> = {
+  IRON_CONDOR:    "IC",
+  SHORT_OPTION:   "SO",
+  LONG_OPTION:    "LO",
+  EQUITY:         "EQ",
+  STRANGLE:       "STR",
+  STRADDLE:       "STD",
+  VERTICAL_SPREAD: "VS",
+};
+
 function PositionRow({ p }: { p: Position }) {
   const [open, setOpen] = useState(false);
   const credit  = p.fill_credit ?? p.entry_credit;
@@ -647,7 +656,8 @@ function PositionRow({ p }: { p: Position }) {
   const dte = typeof p.dte === "number" && !Number.isNaN(p.dte)
     ? p.dte
     : (p.expiry ? Math.ceil((new Date(p.expiry).getTime() - Date.now()) / 86400000) : NaN);
-  const dteDisplay   = Number.isNaN(dte) || dte === undefined ? "--d" : `${dte}d`;
+  const isEquity     = (p.strategy ?? "").toUpperCase() === "EQUITY";
+  const dteDisplay   = isEquity ? "—" : (Number.isNaN(dte) || dte === undefined ? "--d" : `${dte}d`);
   const accountBadge = p.account_id === "PAPER" ? "PAPER" : `···${p.account_id?.slice(-4) ?? ""}`;
   const mark         = p.mark;
 
@@ -666,12 +676,16 @@ function PositionRow({ p }: { p: Position }) {
         {/* Left group — symbol + IC tag + DTE + qty + credit */}
         <div className="flex items-center gap-3 flex-1 min-w-0 font-mono">
           <span className="text-primary font-bold text-base">{p.symbol}</span>
-          <span className="text-[10px] px-1.5 py-0.5 rounded bg-white/5 text-tertiary border border-subtle">IC</span>
+          <span className="text-[10px] px-1.5 py-0.5 rounded bg-white/5 text-tertiary border border-subtle">
+            {strategyBadge[(p.strategy ?? "IRON_CONDOR").toUpperCase()] ?? "—"}
+          </span>
           <span className="text-secondary text-xs">{p.expiry} · {dteDisplay}</span>
           {p.qty != null && (
             <span className="text-tertiary text-xs">{p.qty}×</span>
           )}
-          <span className="text-secondary text-xs">{credit != null ? `$${credit.toFixed(2)} cr` : "—"}</span>
+          <span className="text-secondary text-xs">
+            {credit != null ? `$${credit.toFixed(2)} ${isEquity ? "avg" : "cr"}` : "—"}
+          </span>
           <span className="text-secondary text-xs">
             Mark: {mark != null ? `$${mark.toFixed(2)}` : "—"}
           </span>
@@ -872,7 +886,6 @@ export default function Dashboard() {
   const [positions, setPositions]   = useState<Position[]>([]);
   const [signals, setSignals]       = useState<ExitSignal[]>([]);
   const [accounts, setAccounts]     = useState<Account[]>([]);
-  const [liveNav, setLiveNav]       = useState<number | null>(null);
   const [health, setHealth]         = useState<Health | null>(null);
   const [lastPoll, setLastPoll]     = useState<Date | null>(null);
   const [polling, setPolling]       = useState(false);
@@ -900,20 +913,18 @@ export default function Dashboard() {
   const fetchAll = useCallback(async () => {
     setPolling(true);
     try {
-      const [cRes, pRes, sRes, hRes, aRes, navRes] = await Promise.all([
+      const [cRes, pRes, sRes, hRes, aRes] = await Promise.all([
         axios.get(`${API}/candidates`).catch(() => ({ data: { candidates: [] } })),
         axios.get(`${API}/positions`).catch(() => ({ data: { positions: [] } })),
         axios.get(`${API}/exit-signals`).catch(() => ({ data: { signals: [] } })),
         axios.get(`${API}/health`).catch(() => ({ data: null })),
         axios.get(`${API}/accounts`).catch(() => ({ data: { accounts: [] } })),
-        axios.get(`${API}/nav`).catch(() => ({ data: { combined_live_nav: 0 } })),
       ]);
       setCandidates(cRes.data.candidates || []);
       setPositions(pRes.data.positions || []);
       setSignals(sRes.data.signals || []);
       setHealth(hRes.data);
       setAccounts(aRes.data.accounts || []);
-      setLiveNav(navRes.data?.combined_live_nav ?? 0);
       setLastPoll(new Date());
     } catch (e) {
       console.error("Poll failed:", e);
@@ -982,7 +993,7 @@ export default function Dashboard() {
       <div className="max-w-6xl mx-auto px-6 py-6">
 
         {/* NAV Dashboard */}
-        {accounts.length > 0 && <NavDashboard accounts={accounts} liveNav={liveNav} />}
+        {accounts.length > 0 && <NavDashboard accounts={accounts} />}
 
         {/* Change 7: Tab bar — 13px font, accent active border, badge counts, tab-btn hover */}
         <div className="flex gap-1 mb-6 border-b border-subtle pb-px">
