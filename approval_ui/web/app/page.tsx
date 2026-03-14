@@ -43,10 +43,11 @@ interface Candidate {
 
 interface Position {
   id: number; account_id: string; symbol: string; strategy: string;
-  expiry: string; dte: number; entry_credit: number;
+  expiry: string; dte: number; fill_credit?: number; entry_credit?: number;
   unrealized_pnl: number; profit_pct: number | null;
   net_delta: number; max_risk: number; opened_at: string;
   legs: any; meta: any; position_key: string;
+  qty?: number;
 }
 
 interface ExitSignal {
@@ -133,7 +134,7 @@ function StatusBar({ health }: { health: Health | null }) {
 
 // ── NAV Dashboard ─────────────────────────────────────────────────────────────
 
-function NavDashboard({ accounts }: { accounts: Account[] }) {
+function NavDashboard({ accounts, liveNav }: { accounts: Account[]; liveNav: number | null }) {
   const combined = accounts.reduce((acc, a) => ({
     open_positions: acc.open_positions + (a.open_positions || 0),
     total_credit: acc.total_credit + (a.total_credit || 0),
@@ -143,6 +144,11 @@ function NavDashboard({ accounts }: { accounts: Account[] }) {
 
   const fmt = (n: number | null | undefined, prefix = "$") =>
     n == null ? <span className="text-zinc-600">—</span> : `${prefix}${Number(n).toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+
+  const liveNavFormatted =
+    liveNav !== null
+      ? new Intl.NumberFormat("en-US", { style: "currency", currency: "USD" }).format(liveNav)
+      : "$0.00";
 
   return (
     <div className="rounded-xl border border-zinc-800 overflow-hidden mb-6 shadow-lg">
@@ -163,7 +169,9 @@ function NavDashboard({ accounts }: { accounts: Account[] }) {
             <div className={`text-xs font-mono mb-3 ${a.type === 'LIVE' ? 'text-blue-400' : 'text-zinc-400'}`}>
               ···{a.account_id.slice(-4)}
             </div>
-            <div className="text-2xl font-black font-mono text-zinc-300 mb-1">{fmt(a.nav)}</div>
+            <div className="text-2xl font-black font-mono text-zinc-300 mb-1">
+              {a.type === "LIVE" ? liveNavFormatted : fmt(a.nav)}
+            </div>
             <div className="text-xs text-zinc-600 mb-4 font-mono">NAV</div>
             <div className="space-y-1.5 text-xs font-mono">
               <div className="flex justify-between">
@@ -189,10 +197,22 @@ function NavDashboard({ accounts }: { accounts: Account[] }) {
         ))}
         {/* Combined */}
         <div className="p-5 bg-zinc-900/50">
-          <div className="text-xs font-mono text-zinc-600 mb-1">COMBINED</div>
-          <div className="text-xs font-mono text-zinc-600 mb-3">&nbsp;</div>
-          <div className="text-2xl font-black font-mono text-zinc-300 mb-1">{fmt(null)}</div>
-          <div className="text-xs text-zinc-600 mb-4 font-mono">NAV — pending</div>
+          {(() => {
+            const paperNav = accounts.find(a => a.type === "PAPER")?.nav ?? 20000;
+            const combinedNav = (paperNav ?? 0) + (liveNav ?? 0);
+            return (
+              <>
+                <div className="text-xs font-mono text-zinc-600 mb-1">COMBINED</div>
+                <div className="text-xs font-mono text-zinc-600 mb-3">&nbsp;</div>
+                <div className="text-2xl font-black font-mono text-zinc-300 mb-1">
+                  {combinedNav > 0
+                    ? new Intl.NumberFormat("en-US", { style: "currency", currency: "USD" }).format(combinedNav)
+                    : <span className="text-zinc-600">—</span>}
+                </div>
+                <div className="text-xs text-zinc-600 mb-4 font-mono">NAV</div>
+              </>
+            );
+          })()}
           <div className="space-y-1.5 text-xs font-mono">
             <div className="flex justify-between">
               <span className="text-zinc-600">Open positions</span>
@@ -501,10 +521,16 @@ function TradeCard({ candidate, onApprove, onReject }: {
 
 function PositionRow({ p }: { p: Position }) {
   const [open, setOpen] = useState(false);
+  const credit = p.fill_credit ?? p.entry_credit;
   const pnl = p.unrealized_pnl ?? 0;
   const pct = p.profit_pct;
-  const target50  = p.entry_credit ? p.entry_credit * 0.5 : null;
-  const stop200   = p.entry_credit ? p.entry_credit * 2.0 : null;
+  const target50  = credit != null ? credit * 0.5 : null;
+  const stop200   = credit != null ? credit * 2.0 : null;
+  const dte = typeof p.dte === "number" && !Number.isNaN(p.dte)
+    ? p.dte
+    : (p.expiry ? Math.ceil((new Date(p.expiry).getTime() - Date.now()) / 86400000) : NaN);
+  const dteDisplay = Number.isNaN(dte) || dte === undefined ? "--d" : `${dte}d`;
+  const accountBadge = p.account_id === "PAPER" ? "PAPER" : `···${p.account_id?.slice(-4) ?? ""}`;
 
   return (
     <div className="rounded-xl border border-zinc-800 overflow-hidden mb-3 bg-zinc-900/50 shadow-sm">
@@ -515,11 +541,11 @@ function PositionRow({ p }: { p: Position }) {
         <div className="flex items-center gap-4">
           {open ? <ChevronUp size={14} className="text-zinc-600" /> : <ChevronDown size={14} className="text-zinc-600" />}
           <span className="text-white font-bold text-base font-mono">{p.symbol}</span>
-          <span className="text-zinc-500 text-sm font-mono">{p.expiry} · {p.dte}d</span>
-          <span className="text-zinc-600 text-xs font-mono">···{p.account_id?.slice(-4)}</span>
+          <span className="text-zinc-500 text-sm font-mono">{p.expiry} · {dteDisplay}</span>
+          <span className="text-zinc-600 text-xs font-mono">{accountBadge}</span>
         </div>
         <div className="flex items-center gap-6 font-mono text-sm">
-          <span className="text-zinc-400">${p.entry_credit?.toFixed(2)} cr</span>
+          <span className="text-zinc-400">{credit != null ? `$${credit.toFixed(2)}` : "$—"} cr</span>
           <span className={pnl >= 0 ? "text-emerald-400 font-bold" : "text-red-400 font-bold"}>
             {pnl >= 0 ? "+" : ""}${pnl.toFixed(0)}
             {pct != null && <span className="text-xs ml-1 opacity-70">{pct >= 0 ? "+" : ""}{pct.toFixed(0)}%</span>}
@@ -535,10 +561,12 @@ function PositionRow({ p }: { p: Position }) {
               <div className="text-[10px] font-mono text-zinc-600 tracking-widest mb-3">ENTRY DETAILS</div>
               <div className="space-y-2 text-sm font-mono">
                 {[
-                  ["Credit received", `$${p.entry_credit?.toFixed(2)}`],
+                  ["Credit received", credit != null ? `$${credit.toFixed(2)}` : "—"],
+                  ["Contracts", p.qty != null ? String(p.qty) : "—"],
+                  ["Total credit gained", credit != null && p.qty != null ? `$${(credit * p.qty * 100).toFixed(2)}` : "—"],
                   ["Max risk (margin)", p.max_risk != null ? `$${p.max_risk?.toFixed(2)}` : "—"],
                   ["Net delta", p.net_delta?.toFixed(4) ?? "—"],
-                  ["Account", `···${p.account_id?.slice(-4)}`],
+                  ["Account", accountBadge],
                 ].map(([l, v]) => (
                   <div key={l} className="flex justify-between">
                     <span className="text-zinc-600">{l}</span>
@@ -705,6 +733,7 @@ export default function Dashboard() {
   const [positions, setPositions]   = useState<Position[]>([]);
   const [signals, setSignals]       = useState<ExitSignal[]>([]);
   const [accounts, setAccounts]     = useState<Account[]>([]);
+  const [liveNav, setLiveNav]       = useState<number | null>(null);
   const [health, setHealth]         = useState<Health | null>(null);
   const [lastPoll, setLastPoll]     = useState<Date | null>(null);
   const [polling, setPolling]       = useState(false);
@@ -713,18 +742,20 @@ export default function Dashboard() {
   const fetchAll = useCallback(async () => {
     setPolling(true);
     try {
-      const [cRes, pRes, sRes, hRes, aRes] = await Promise.all([
+      const [cRes, pRes, sRes, hRes, aRes, navRes] = await Promise.all([
         axios.get(`${API}/candidates`).catch(() => ({ data: { candidates: [] } })),
         axios.get(`${API}/positions`).catch(() => ({ data: { positions: [] } })),
         axios.get(`${API}/exit-signals`).catch(() => ({ data: { signals: [] } })),
         axios.get(`${API}/health`).catch(() => ({ data: null })),
         axios.get(`${API}/accounts`).catch(() => ({ data: { accounts: [] } })),
+        axios.get(`${API}/nav`).catch(() => ({ data: { combined_live_nav: 0 } })),
       ]);
       setCandidates(cRes.data.candidates || []);
       setPositions(pRes.data.positions || []);
       setSignals(sRes.data.signals || []);
       setHealth(hRes.data);
       setAccounts(aRes.data.accounts || []);
+      setLiveNav(navRes.data?.combined_live_nav ?? 0);
       setLastPoll(new Date());
     } catch (e) {
       console.error("Poll failed:", e);
@@ -741,7 +772,7 @@ export default function Dashboard() {
 
   const handleApprove = async (id: number) => {
     try {
-      await axios.post(`${API}/approve/${id}`, { idempotency_key: Date.now().toString() });
+      await axios.post(`${API}/candidates/${id}/approve`, { idempotency_key: Date.now().toString() });
       fetchAll();
     } catch (err) {
       alert("Execution failed. Check backend logs.");
@@ -750,7 +781,7 @@ export default function Dashboard() {
 
   const handleReject = async (id: number) => {
     try {
-      await axios.post(`${API}/reject/${id}`, { reason: "Manual UI Rejection" });
+      await axios.post(`${API}/candidates/${id}/reject`, { reason: "Manual UI Rejection" });
       fetchAll();
     } catch (err) {
       console.error(err);
@@ -804,7 +835,7 @@ export default function Dashboard() {
       <div className="max-w-6xl mx-auto px-6 py-6">
 
         {/* NAV Dashboard */}
-        {accounts.length > 0 && <NavDashboard accounts={accounts} />}
+        {accounts.length > 0 && <NavDashboard accounts={accounts} liveNav={liveNav} />}
 
         {/* Tabs */}
         <div className="flex gap-2 mb-6 border-b border-zinc-800 pb-px">

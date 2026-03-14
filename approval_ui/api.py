@@ -12,6 +12,7 @@ Endpoints:
   POST /exit-signals/{id}/snooze      — snooze a signal for 24h
   POST /exit-signals/{id}/dismiss     — dismiss a signal
   GET  /accounts                      — per-account summary from positions table
+  GET  /nav                           — combined live NAV from reconciler.log
   GET  /events/{symbol}               — upcoming earnings/FOMC for a symbol
   GET  /health                        — system health
 
@@ -233,7 +234,8 @@ def get_positions():
             SELECT id, account_id, symbol, strategy, expiry, dte,
                    fill_credit, net_delta, unrealized_pnl,
                    opened_at, status, legs, meta,
-                   max_risk, position_key
+                   max_risk, position_key,
+                   COALESCE(quantity, qty) AS qty
             FROM positions
             WHERE status = 'open'
             ORDER BY opened_at DESC
@@ -324,6 +326,46 @@ def acknowledge_signal(signal_id: int):
     return {"status": "acknowledged", "id": signal_id}
 
 
+# ── NAV (reconciler log) ───────────────────────────────────────────────────────
+
+# Project root: approval_ui/api.py -> parent.parent
+RECONCILER_LOG = (Path(__file__).resolve().parent.parent / "reconciler.log")
+
+
+@app.get("/nav")
+def get_nav():
+    """
+    Read the last non-empty line of reconciler.log (JSON), return combined_live_nav.
+    Log format: one JSON object per line (full_summary with "nav": {"combined_live_nav": ...}).
+    Fallback to 0 if file missing, empty, or parse error.
+    """
+    try:
+        if not RECONCILER_LOG.exists():
+            logger.debug("get_nav: reconciler.log not found at %s", RECONCILER_LOG)
+            return {"combined_live_nav": 0}
+        text = RECONCILER_LOG.read_text(encoding="utf-8", errors="replace").strip()
+        # Split on newlines only; strip \r so last line parses (Windows/mixed line endings)
+        lines = [ln.replace("\r", "").strip() for ln in text.split("\n") if ln.replace("\r", "").strip()]
+        if not lines:
+            return {"combined_live_nav": 0}
+        last_line = lines[-1]
+        parsed = json.loads(last_line)
+        nav = parsed.get("nav")
+        if not isinstance(nav, dict):
+            return {"combined_live_nav": 0}
+        combined = nav.get("combined_live_nav")
+        if combined is None:
+            return {"combined_live_nav": 0, "accounts": {}}
+        accounts_nav = nav.get("accounts") or {}
+        return {
+            "combined_live_nav": float(combined),
+            "accounts": {k: float(v) for k, v in accounts_nav.items()},
+        }
+    except (json.JSONDecodeError, ValueError, OSError) as e:
+        logger.warning("get_nav: could not read/parse reconciler.log — %s", e)
+        return {"combined_live_nav": 0}
+
+
 # ── Accounts ──────────────────────────────────────────────────────────────────
 
 # --- SAFE SCHWAB CACHE SETTINGS ---
@@ -365,9 +407,9 @@ def get_accounts(background_tasks: BackgroundTasks):
             {
                 "account_id": "PAPER_ACCT_01",
                 "type": "PAPER",
-                "nav": 100000.00,
-                "daily_pnl": 150.00, 
-                "buying_power": 98500.00
+                "nav": 20000.00,
+                "daily_pnl": 0.00,
+                "buying_power": 20000.00
             },
             {
                 "account_id": "SCHWAB_LIVE",
