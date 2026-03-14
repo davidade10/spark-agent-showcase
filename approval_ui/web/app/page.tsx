@@ -681,7 +681,7 @@ function PositionRow({ p }: { p: Position }) {
           </span>
           <span className="text-secondary text-xs">{p.expiry} · {dteDisplay}</span>
           {p.qty != null && (
-            <span className="text-tertiary text-xs">{p.qty}×</span>
+            <span className="text-tertiary text-xs">{isEquity ? `${p.qty} sh` : `${p.qty}×`}</span>
           )}
           <span className="text-secondary text-xs">
             {credit != null ? `$${credit.toFixed(2)} ${isEquity ? "avg" : "cr"}` : "—"}
@@ -716,12 +716,12 @@ function PositionRow({ p }: { p: Position }) {
               <div className="text-[10px] font-mono text-tertiary tracking-widest mb-3">ENTRY DETAILS</div>
               <div className="space-y-2 text-sm font-mono">
                 {([
-                  ["Credit received",    credit != null ? `$${credit.toFixed(2)}` : "—"],
-                  ["Contracts",          p.qty != null ? String(p.qty) : "—"],
-                  ["Total credit gained", credit != null && p.qty != null ? `$${(credit * p.qty * 100).toFixed(2)}` : "—"],
-                  ["Max risk (margin)",  p.max_risk != null ? `$${p.max_risk?.toFixed(2)}` : "—"],
-                  ["Net delta",          p.net_delta?.toFixed(4) ?? "—"],
-                  ["Account",            accountBadge],
+                  [isEquity ? "Avg price"  : "Credit received", credit != null ? `$${credit.toFixed(2)}` : "—"],
+                  [isEquity ? "Shares"     : "Contracts",       p.qty != null ? String(p.qty) : "—"],
+                  ...(!isEquity ? [["Total credit gained", credit != null && p.qty != null ? `$${(credit * p.qty * 100).toFixed(2)}` : "—"]] as [string, string][] : []),
+                  ...(!isEquity ? [["Max risk (margin)",  p.max_risk != null ? `$${p.max_risk?.toFixed(2)}` : "—"]] as [string, string][] : []),
+                  ...(!isEquity ? [["Net delta",          p.net_delta?.toFixed(4) ?? "—"]] as [string, string][] : []),
+                  ["Account", accountBadge],
                 ] as [string, string][]).map(([l, v]) => (
                   <div key={l} className="flex justify-between">
                     <span className="text-tertiary">{l}</span>
@@ -735,10 +735,10 @@ function PositionRow({ p }: { p: Position }) {
               <div className="text-[10px] font-mono text-tertiary tracking-widest mb-3">UNREALIZED P/L</div>
               <div className="space-y-2 text-sm font-mono">
                 {([
-                  ["Gross P/L",   { val: `${pnl >= 0 ? "+" : ""}$${pnl.toFixed(2)}`,                           color: pnl >= 0 ? "text-success" : "text-danger" }],
-                  ["% of credit", { val: pct != null ? `${pct >= 0 ? "+" : ""}${pct.toFixed(1)}%` : "—",       color: (pct ?? 0) >= 0 ? "text-success" : "text-danger" }],
-                  ["50% target",  { val: target50 != null ? `$${target50.toFixed(2)}` : "—",                    color: "text-secondary" }],
-                  ["200% stop",   { val: stop200  != null ? `$${stop200.toFixed(2)}`  : "—",                    color: "text-danger" }],
+                  ["Gross P/L",                    { val: `${pnl >= 0 ? "+" : ""}$${pnl.toFixed(2)}`,                     color: pnl >= 0 ? "text-success" : "text-danger" }],
+                  [isEquity ? "% change" : "% of credit", { val: pct != null ? `${pct >= 0 ? "+" : ""}${pct.toFixed(1)}%` : "—", color: (pct ?? 0) >= 0 ? "text-success" : "text-danger" }],
+                  ...(!isEquity ? [["50% target", { val: target50 != null ? `$${target50.toFixed(2)}` : "—", color: "text-secondary" }]] as [string, { val: string; color: string }][] : []),
+                  ...(!isEquity ? [["200% stop",  { val: stop200  != null ? `$${stop200.toFixed(2)}`  : "—", color: "text-danger"    }]] as [string, { val: string; color: string }][] : []),
                 ] as [string, { val: string; color: string }][]).map(([l, v]) => (
                   <div key={l} className="flex justify-between">
                     <span className="text-tertiary">{l}</span>
