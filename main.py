@@ -17,7 +17,6 @@ Ctrl+C to stop.
 """
 
 import logging
-import pathlib
 import time
 from datetime import datetime, timezone
 
@@ -38,13 +37,11 @@ from strategy_engine.rules_gate     import run_gate as run_rules_gate
 from llm_layer.trade_card           import generate_one
 
 # ── Logging setup ─────────────────────────────────────────────────────────────
-pathlib.Path("logs").mkdir(exist_ok=True)
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(name)s — %(message)s",
     handlers=[
-        logging.StreamHandler(),                          # print to terminal
-        logging.FileHandler("logs/agent.log"),            # write to log file
+        logging.StreamHandler(),   # start_sparky redirects stdout→logs/agent.log
     ],
 )
 logger = logging.getLogger(__name__)

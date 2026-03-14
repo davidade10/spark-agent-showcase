@@ -25,12 +25,11 @@ from __future__ import annotations
 import json
 import logging
 import sys
-import time  # <-- ADDED HERE
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Optional
 
-from fastapi import FastAPI, HTTPException, BackgroundTasks  # <-- ADDED BackgroundTasks HERE
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from sqlalchemy import create_engine, text
@@ -377,59 +376,95 @@ def get_nav():
 
 # ── Accounts ──────────────────────────────────────────────────────────────────
 
-# --- SAFE SCHWAB CACHE SETTINGS ---
-LIVE_NAV_CACHE = {
-    "nav": 0.0,
-    "buying_power": 0.0,
-    "daily_pnl": 0.0,
-    "last_updated": 0
-}
-CACHE_TTL_SECONDS = 60 # Only ask Schwab once per minute
+PAPER_ACCOUNT_NAV: float = float(
+    __import__("os").getenv("PAPER_ACCOUNT_NAV", "20000")
+)
 
-def fetch_live_schwab_data():
-    """Silently fetches real data from Schwab in the background."""
-    global LIVE_NAV_CACHE
+
+def _read_reconciler_nav() -> dict[str, Any]:
+    """
+    Parse the last non-empty line of reconciler.log and return the nav dict.
+    Returns {"accounts": {}, "combined_live_nav": 0} on any failure.
+    """
+    empty: dict[str, Any] = {"accounts": {}, "combined_live_nav": 0}
     try:
-        # TODO: Initialize your Schwab client here
-        # client = get_client() 
-        # resp = client.get_account_balances("YOUR_ACCOUNT_HASH").json()
-        
-        # LIVE_NAV_CACHE["nav"] = resp['securitiesAccount']['currentBalances']['liquidationValue']
-        # LIVE_NAV_CACHE["buying_power"] = resp['securitiesAccount']['currentBalances']['buyingPower']
-        
-        LIVE_NAV_CACHE["last_updated"] = time.time()
-        
+        if not RECONCILER_LOG.exists():
+            return empty
+        raw = RECONCILER_LOG.read_text(encoding="utf-8", errors="replace").strip()
+        lines = [ln.replace("\r", "").strip() for ln in raw.split("\n") if ln.replace("\r", "").strip()]
+        if not lines:
+            return empty
+        parsed = json.loads(lines[-1])
+        nav = parsed.get("nav")
+        if not isinstance(nav, dict):
+            return empty
+        return {
+            "accounts":         {k: float(v) for k, v in (nav.get("accounts") or {}).items()},
+            "combined_live_nav": float(nav.get("combined_live_nav") or 0),
+        }
     except Exception as e:
-        print(f"Error fetching live Schwab data: {e}")
+        logger.warning("_read_reconciler_nav: could not parse reconciler.log — %s", e)
+        return empty
+
 
 @app.get("/accounts")
-def get_accounts(background_tasks: BackgroundTasks):
-    """Returns dual account summaries, safely caching the live Schwab data."""
-    global LIVE_NAV_CACHE
-    
-    # If cache is older than 60 seconds, trigger background refresh
-    if time.time() - LIVE_NAV_CACHE["last_updated"] > CACHE_TTL_SECONDS:
-        background_tasks.add_task(fetch_live_schwab_data)
+def get_accounts():
+    """
+    Per-account summary built from:
+      - reconciler.log  → per-account NAV (accounts dict keyed by last-4 digits)
+      - positions table → open position counts per account_id
+    Fields without a live source (buying_power, daily_pnl, total_credit,
+    total_margin, total_pnl) are returned as None so the UI renders '—'.
+    """
+    nav_data     = _read_reconciler_nav()
+    accounts_nav = nav_data["accounts"]   # {"8096": 8066.71, "5760": 6596.56}
 
-    return {
-        "accounts": [
-            {
-                "account_id": "PAPER_ACCT_01",
-                "type": "PAPER",
-                "nav": 20000.00,
-                "daily_pnl": 0.00,
-                "buying_power": 20000.00
-            },
-            {
-                "account_id": "SCHWAB_LIVE",
-                "type": "LIVE",
-                # Pass cached numbers if available, otherwise show placeholder
-                "nav": LIVE_NAV_CACHE["nav"] if LIVE_NAV_CACHE["nav"] > 0 else 250000.00, 
-                "daily_pnl": LIVE_NAV_CACHE["daily_pnl"],
-                "buying_power": LIVE_NAV_CACHE["buying_power"] if LIVE_NAV_CACHE["buying_power"] > 0 else 250000.00
-            }
-        ]
-    }
+    # Position counts per account_id
+    pos_counts: dict[str, int] = {}
+    try:
+        engine = get_engine()
+        with engine.connect() as conn:
+            rows = conn.execute(text("""
+                SELECT account_id, COUNT(*) AS cnt
+                FROM positions
+                WHERE status = 'open'
+                GROUP BY account_id
+            """)).fetchall()
+        for r in rows:
+            pos_counts[str(r[0])] = int(r[1])
+    except Exception as e:
+        logger.warning("get_accounts: could not query position counts — %s", e)
+
+    result: list[dict[str, Any]] = []
+
+    # One entry per real Schwab account found in the NAV data
+    for last4, nav_val in accounts_nav.items():
+        result.append({
+            "account_id":     last4,
+            "type":           "LIVE",
+            "nav":            nav_val,
+            "open_positions": pos_counts.get(last4, 0),
+            "buying_power":   None,
+            "daily_pnl":      None,
+            "total_credit":   None,
+            "total_margin":   None,
+            "total_pnl":      None,
+        })
+
+    # Paper account — always present
+    result.append({
+        "account_id":     "PAPER",
+        "type":           "PAPER",
+        "nav":            PAPER_ACCOUNT_NAV,
+        "open_positions": pos_counts.get("PAPER", 0),
+        "buying_power":   None,
+        "daily_pnl":      None,
+        "total_credit":   None,
+        "total_margin":   None,
+        "total_pnl":      None,
+    })
+
+    return {"accounts": result}
 # ── Events context ────────────────────────────────────────────────────────────
 
 @app.get("/events/{symbol}")
