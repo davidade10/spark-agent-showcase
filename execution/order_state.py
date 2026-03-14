@@ -119,15 +119,18 @@ def migrate_orders_schema(engine) -> None:
     # order_id added without FK — see module docstring note.
     # source/close_reason added for reconciler.py (tracks how a position was opened/closed).
     _positions_add: list[tuple[str, str]] = [
-        ("long_put_strike",   "NUMERIC"),
-        ("short_put_strike",  "NUMERIC"),
-        ("short_call_strike", "NUMERIC"),
-        ("long_call_strike",  "NUMERIC"),
-        ("quantity",          "INTEGER"),
-        ("fill_credit",       "NUMERIC"),
-        ("order_id",          "INTEGER"),
-        ("source",            "TEXT"),          # 'paper' | 'manual' | 'executor'
-        ("close_reason",      "TEXT"),          # 'manual_or_expired' | 'exit_signal' | …
+        ("long_put_strike",      "NUMERIC"),
+        ("short_put_strike",     "NUMERIC"),
+        ("short_call_strike",    "NUMERIC"),
+        ("long_call_strike",     "NUMERIC"),
+        ("quantity",             "INTEGER"),
+        ("fill_credit",          "NUMERIC"),
+        ("order_id",             "INTEGER"),
+        ("source",               "TEXT"),          # 'paper' | 'manual' | 'executor'
+        ("close_reason",         "TEXT"),          # 'manual_or_expired' | 'exit_signal' | …
+        # Closure-hardening columns (Phase 5 safety)
+        ("closure_strikes",      "INTEGER DEFAULT 0"),  # consecutive absences counter
+        ("last_seen_in_schwab",  "TIMESTAMPTZ"),         # last confirmed-live timestamp
     ]
 
     # Legacy NOT NULL columns that conflict with Phase 5 writes.
@@ -174,6 +177,14 @@ def migrate_orders_schema(engine) -> None:
                 conn.execute(text(
                     f"ALTER TABLE {table} ALTER COLUMN {col} {action}"
                 ))
+
+        # reconciler_state — key/value store for run counter and future flags.
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS reconciler_state (
+                key   TEXT PRIMARY KEY,
+                value TEXT
+            )
+        """))
 
         # Unique index on positions.position_key — required for reconciler's
         # ON CONFLICT (position_key) DO NOTHING INSERT.

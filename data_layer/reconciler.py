@@ -19,8 +19,8 @@ a single hash.
 Implementation traps addressed:
   Trap 1 — Multi-account: get_account_numbers() loop, not a single hash
   Trap 2 — Net credit: summed from individual leg averagePrice values
-  Trap 3 — OCC grouping: uses instrument.underlyingSymbol + instrument.expirationDate,
-            not OCC string parsing
+  Trap 3 — OCC grouping: parses instrument.symbol (OCC standard) for root, expiry, type, strike;
+            lightweight API does not return underlyingSymbol or expirationDate
   Trap 4 — Asymmetric leg quantities: asserted equal; mismatches go to errors[]
   Trap 5 — Float strike equality: math.isclose(abs_tol=0.01) throughout
   Trap 6 — Date normalization: dateutil.parser → strftime('%Y-%m-%d') everywhere
@@ -92,6 +92,39 @@ def _leg_avg_price(pos: dict, qty_signed: int) -> Optional[float]:
     return None
 
 
+# ── OCC symbol parser ─────────────────────────────────────────────────────────
+
+def _parse_occ_symbol(occ_string: str) -> dict:
+    """
+    Parse an OCC option symbol by character position (OCC standard).
+
+    Layout: [0:6] root (strip trailing spaces), [6:12] YYMMDD, [12:13] C|P, [13:21] strike*1000.
+    Returns dict: root (str), expiry (YYYY-MM-DD), option_type ('C' or 'P'), strike (float).
+    Raises ValueError if the string is too short or invalid.
+    """
+    s = (occ_string or "").strip()
+    if len(s) < 21:
+        raise ValueError(f"OCC symbol too short: {occ_string!r}")
+    root = s[0:6].rstrip()
+    yy_mm_dd = s[6:12]
+    option_type = s[12:13].upper()
+    strike_str = s[13:21]
+    if option_type not in ("C", "P"):
+        raise ValueError(f"Invalid OCC option type: {option_type!r}")
+    try:
+        year = 2000 + int(yy_mm_dd[0:2])
+        month = int(yy_mm_dd[2:4])
+        day = int(yy_mm_dd[4:6])
+        expiry = f"{year:04d}-{month:02d}-{day:02d}"
+    except (ValueError, IndexError) as e:
+        raise ValueError(f"Invalid OCC expiry {yy_mm_dd!r}") from e
+    try:
+        strike = int(strike_str) / 1000.0
+    except ValueError as e:
+        raise ValueError(f"Invalid OCC strike {strike_str!r}") from e
+    return {"root": root, "expiry": expiry, "option_type": option_type, "strike": strike}
+
+
 # ── Schwab positions parser ───────────────────────────────────────────────────
 
 def _parse_schwab_positions(
@@ -103,11 +136,9 @@ def _parse_schwab_positions(
     Extract iron condor positions from the raw Schwab positions list for one
     account.  Returns a list of parsed position dicts, one per condor.
 
-    Schwab returns individual option legs — we group by (underlyingSymbol,
-    normalised expirationDate), then identify the four condor legs.
-
-    Traps addressed: 3 (use instrument fields, not OCC parsing), 4 (asymmetric
-    qty check), 6 (date normalisation).
+    Schwab's lightweight instrument block does not include underlyingSymbol or
+    expirationDate; we parse the OCC symbol (instrument.symbol) to get root,
+    expiry, put/call type, and strike, then group by (root, expiry).
     """
     # Filter to OPTION positions only
     option_legs: list[dict] = []
@@ -116,23 +147,23 @@ def _parse_schwab_positions(
         if instr.get("assetType") == "OPTION":
             option_legs.append(pos)
 
-    # Group by (underlying, normalised_expiry)  (Trap 3)
+    # Group by (underlying, expiry) using OCC symbol parsing
     groups: dict[tuple[str, str], list[dict]] = {}
     for pos in option_legs:
         instr = pos.get("instrument") or {}
-        underlying = instr.get("underlyingSymbol") or ""
-        exp_raw    = instr.get("expirationDate")
-        if not underlying or exp_raw is None:
-            logger.warning(
-                f"reconciler: skipping leg with missing underlyingSymbol "
-                f"or expirationDate — {instr.get('symbol')}"
-            )
+        occ_raw = instr.get("symbol")
+        if not occ_raw:
+            logger.warning("reconciler: skipping leg with no instrument.symbol")
             continue
         try:
-            expiry = _norm_date(exp_raw)   # Trap 6
-        except Exception as e:
-            logger.warning(f"reconciler: could not normalise date {exp_raw!r} — {e}")
+            parsed = _parse_occ_symbol(occ_raw)
+        except ValueError as e:
+            logger.warning(f"reconciler: skipping leg — OCC parse failed for {occ_raw!r}: {e}")
             continue
+        underlying = parsed["root"]
+        expiry = parsed["expiry"]
+        # Attach parsed data to the position for later use
+        pos["_occ"] = parsed
         groups.setdefault((underlying, expiry), []).append(pos)
 
     parsed: list[dict] = []
@@ -145,8 +176,9 @@ def _parse_schwab_positions(
         short_calls: list[dict] = []
 
         for pos in legs:
-            instr     = pos.get("instrument") or {}
-            put_call  = (instr.get("putCall") or "").upper()   # "PUT" or "CALL"
+            occ = pos.get("_occ") or {}
+            # Use OCC option_type (P/C); API may not return putCall in lightweight block
+            put_call = "PUT" if occ.get("option_type") == "P" else "CALL"
             long_qty  = int(pos.get("longQuantity")  or 0)
             short_qty = int(pos.get("shortQuantity") or 0)
 
@@ -202,8 +234,11 @@ def _parse_schwab_positions(
 
         quantity = lp_qty
 
-        # Extract strikes from instrument.strikePrice (Trap 3)
+        # Strikes from OCC-parsed data (lightweight API often omits strikePrice)
         def _strike(pos: dict) -> Optional[float]:
+            occ = pos.get("_occ")
+            if occ and "strike" in occ:
+                return occ["strike"]
             v = (pos.get("instrument") or {}).get("strikePrice")
             return float(v) if v is not None else None
 
@@ -211,19 +246,6 @@ def _parse_schwab_positions(
         sp_strike = _strike(sp_pos)
         lc_strike = _strike(lc_pos)
         sc_strike = _strike(sc_pos)
-
-        if any(s is None for s in (lp_strike, sp_strike, lc_strike, sc_strike)):
-            # Fall back to OCC symbol parsing for strikes
-            import re
-            OCC_STRIKE = re.compile(r"(\d{8})$")
-            def _occ_strike(pos: dict) -> Optional[float]:
-                sym = (pos.get("instrument") or {}).get("symbol") or ""
-                m = OCC_STRIKE.search(sym.strip())
-                return int(m.group(1)) / 1000.0 if m else None
-            lp_strike = lp_strike or _occ_strike(lp_pos)
-            sp_strike = sp_strike or _occ_strike(sp_pos)
-            lc_strike = lc_strike or _occ_strike(lc_pos)
-            sc_strike = sc_strike or _occ_strike(sc_pos)
 
         if any(s is None for s in (lp_strike, sp_strike, lc_strike, sc_strike)):
             msg = (
@@ -334,13 +356,32 @@ def reconcile(engine, schwab_client) -> dict:
          in both, qty/strike differ → UPDATE DB row to match, log discrepancy
     5. Returns {"inserted": [...], "closed": [...], "updated": [...], "errors": [...]}
     """
-    summary: dict[str, list] = {
-        "inserted": [],
-        "closed":   [],
-        "updated":  [],
-        "errors":   [],
+    summary: dict = {
+        "inserted":     [],
+        "closed":       [],
+        "updated":      [],
+        "errors":       [],
+        "skipped_legs": 0,
+        "run_id":       None,
     }
     now = datetime.now(timezone.utc)
+
+    # ── Run counter ───────────────────────────────────────────────────────────
+    run_id: Optional[int] = None
+    try:
+        with engine.begin() as _rc_conn:
+            row = _rc_conn.execute(text(
+                "SELECT value FROM reconciler_state WHERE key = 'run_count'"
+            )).fetchone()
+            run_id = (int(row[0]) if row else 0) + 1
+            _rc_conn.execute(text("""
+                INSERT INTO reconciler_state (key, value) VALUES ('run_count', :v)
+                ON CONFLICT (key) DO UPDATE SET value = :v
+            """), {"v": str(run_id)})
+        summary["run_id"] = run_id
+        logger.info(f"reconcile: starting run_id={run_id}")
+    except Exception as e:
+        logger.warning(f"reconcile: could not increment run_count — {e}")
 
     # ── Step 1: discover all account hashes ───────────────────────────────────
     try:
@@ -370,6 +411,8 @@ def reconcile(engine, schwab_client) -> dict:
 
     # ── Step 2: fetch Schwab positions for all live accounts ──────────────────
     all_schwab_positions: list[dict] = []
+    total_legs_received:  int = 0
+    total_condors_parsed: int = 0
 
     for last4, hash_val in account_map.items():
         try:
@@ -388,12 +431,47 @@ def reconcile(engine, schwab_client) -> dict:
         raw_positions = (
             data.get("securitiesAccount", {}).get("positions") or []
         )
+        # Count OPTION legs for parser health check
+        option_legs = sum(
+            1 for p in raw_positions
+            if (p.get("instrument") or {}).get("assetType") == "OPTION"
+        )
+        total_legs_received += option_legs
+
         parsed = _parse_schwab_positions(raw_positions, last4, summary["errors"])
+        total_condors_parsed += len(parsed)
         logger.info(
             f"reconcile: account ...{last4} — "
-            f"{len(raw_positions)} raw legs → {len(parsed)} iron condors parsed"
+            f"{option_legs} option legs → {len(parsed)} iron condors parsed"
         )
         all_schwab_positions.extend(parsed)
+
+    # ── Parser health check — block closures if parser looks broken ───────────
+    skipped_legs = total_legs_received - (total_condors_parsed * 4)
+    summary["skipped_legs"] = max(0, skipped_legs)
+    closures_blocked = False
+
+    if total_legs_received >= 4:
+        expected_condors = total_legs_received / 4
+        parse_ratio = total_condors_parsed / expected_condors
+
+        if total_condors_parsed == 0:
+            msg = (
+                f"Parser produced 0 condors from {total_legs_received} legs — "
+                "closure writes BLOCKED for safety. Investigate parser."
+            )
+            logger.critical(msg)
+            summary["errors"].append(msg)
+            closures_blocked = True
+        elif parse_ratio < 0.5:
+            msg = (
+                f"Parser health WARNING: parsed {total_condors_parsed} condors "
+                f"from {total_legs_received} legs (ratio={parse_ratio:.2f} < 0.5) — "
+                "closure writes BLOCKED for safety."
+            )
+            logger.warning(msg)
+            summary["errors"].append(msg)
+            closures_blocked = True
 
     # ── Step 3: load open non-PAPER positions from DB ─────────────────────────
     with engine.connect() as conn:
@@ -401,7 +479,8 @@ def reconcile(engine, schwab_client) -> dict:
             SELECT id, account_id, symbol, expiry,
                    long_put_strike, short_put_strike,
                    short_call_strike, long_call_strike,
-                   quantity, fill_credit, status, position_key
+                   quantity, fill_credit, status, position_key,
+                   COALESCE(closure_strikes, 0) AS closure_strikes
             FROM positions
             WHERE status = 'open'
               AND account_id != 'PAPER'
@@ -498,12 +577,14 @@ def reconcile(engine, schwab_client) -> dict:
                     )
                     conn.execute(text("""
                         UPDATE positions
-                        SET quantity          = :quantity,
-                            long_put_strike   = :long_put_strike,
-                            short_put_strike  = :short_put_strike,
-                            short_call_strike = :short_call_strike,
-                            long_call_strike  = :long_call_strike,
-                            last_reconciled_at = :now
+                        SET quantity             = :quantity,
+                            long_put_strike      = :long_put_strike,
+                            short_put_strike     = :short_put_strike,
+                            short_call_strike    = :short_call_strike,
+                            long_call_strike     = :long_call_strike,
+                            last_reconciled_at   = :now,
+                            closure_strikes      = 0,
+                            last_seen_in_schwab  = :now
                         WHERE id = :id
                     """), {
                         "quantity":          sp["quantity"],
@@ -521,39 +602,76 @@ def reconcile(engine, schwab_client) -> dict:
                         "changes":  {k: {"before": v[0], "after": v[1]} for k, v in changes.items()},
                     })
                 else:
-                    # No discrepancy — just update last_reconciled_at
+                    # No discrepancy — reset strike counter, update timestamps
                     conn.execute(text("""
                         UPDATE positions
-                        SET last_reconciled_at = :now
+                        SET last_reconciled_at  = :now,
+                            closure_strikes     = 0,
+                            last_seen_in_schwab = :now
                         WHERE id = :id
                     """), {"now": now, "id": db_match["id"]})
 
-        # DB open positions NOT seen in Schwab → mark closed
+        # DB open positions NOT seen in Schwab → 3-strike system before closing
         for db in db_positions:
             if db["id"] not in matched_db_ids:
-                logger.info(
-                    f"reconcile: CLOSING {db['symbol']} {db.get('expiry')} "
-                    f"id={db['id']} — not seen in Schwab (expired or manually closed)"
-                )
-                conn.execute(text("""
-                    UPDATE positions
-                    SET status      = 'closed',
-                        close_reason = 'manual_or_expired',
-                        closed_at   = :now,
-                        last_reconciled_at = :now
-                    WHERE id = :id
-                """), {"now": now, "id": db["id"]})
-                summary["closed"].append({
-                    "id":     db["id"],
-                    "symbol": db["symbol"],
-                    "expiry": str(db.get("expiry")),
-                })
+                sym    = db["symbol"]
+                expiry = str(db.get("expiry"))
+
+                if closures_blocked:
+                    logger.info(
+                        f"reconcile: SKIPPING potential closure of {sym} {expiry} "
+                        f"id={db['id']} — closures blocked by parser health check"
+                    )
+                    if summary["skipped_legs"] > 0:
+                        logger.warning(
+                            f"WARNING: {summary['skipped_legs']} legs were unparseable — "
+                            f"closures may be due to parser failure, not actual position absence"
+                        )
+                    continue
+
+                current_strikes = int(db.get("closure_strikes") or 0)
+                new_strikes = current_strikes + 1
+
+                if new_strikes < 3:
+                    # Not enough consecutive absences — record strike, do NOT close
+                    conn.execute(text("""
+                        UPDATE positions
+                        SET closure_strikes    = :strikes,
+                            last_reconciled_at = :now
+                        WHERE id = :id
+                    """), {"strikes": new_strikes, "now": now, "id": db["id"]})
+                    logger.info(
+                        f"reconcile: Strike {new_strikes}/3 for {sym} {expiry} "
+                        f"id={db['id']} — not seen in Schwab "
+                        f"(will close after 3 consecutive absences)"
+                    )
+                else:
+                    # 3 consecutive absences confirmed — close
+                    logger.info(
+                        f"reconcile: 3 consecutive absences confirmed — "
+                        f"closing {sym} {expiry} id={db['id']}"
+                    )
+                    conn.execute(text("""
+                        UPDATE positions
+                        SET status             = 'closed',
+                            close_reason       = 'manual_or_expired',
+                            closed_at          = :now,
+                            last_reconciled_at = :now
+                        WHERE id = :id
+                    """), {"now": now, "id": db["id"]})
+                    summary["closed"].append({
+                        "id":     db["id"],
+                        "symbol": sym,
+                        "expiry": expiry,
+                    })
 
     logger.info(
         f"reconcile complete — "
+        f"run_id={run_id} "
         f"inserted={len(summary['inserted'])} "
         f"closed={len(summary['closed'])} "
         f"updated={len(summary['updated'])} "
+        f"skipped_legs={summary['skipped_legs']} "
         f"errors={len(summary['errors'])}"
     )
     return summary
