@@ -304,12 +304,16 @@ function AccountCard({ label, accountId, nav, dailyPnl, unrealizedPnl, buyingPow
 function NavDashboard({ accounts, liveNav }: { accounts: Account[]; liveNav: number | null }) {
   const combined = accounts.reduce((acc, a) => ({
     open_positions: acc.open_positions + (a.open_positions ?? 0),
-    total_margin:   acc.total_margin   + (a.total_margin   ?? 0),
-    total_pnl:      acc.total_pnl      + (a.total_pnl      ?? 0),
-  }), { open_positions: 0, total_margin: 0, total_pnl: 0 });
+    total_margin:   a.total_margin   != null ? acc.total_margin   + a.total_margin   : acc.total_margin,
+    total_pnl:      a.total_pnl      != null ? acc.total_pnl      + a.total_pnl      : acc.total_pnl,
+    has_margin:     acc.has_margin || a.total_margin != null,
+    has_pnl:        acc.has_pnl    || a.total_pnl    != null,
+  }), { open_positions: 0, total_margin: 0, total_pnl: 0, has_margin: false, has_pnl: false });
 
-  const paperNav   = accounts.find(a => a.type === "PAPER")?.nav ?? 20000;
-  const combinedNav = (paperNav ?? 0) + (liveNav ?? 0);
+  const paperNav   = accounts.find(a => a.type === "PAPER")?.nav ?? null;
+  const combinedNav = paperNav != null || liveNav != null
+    ? (paperNav ?? 0) + (liveNav ?? 0)
+    : null;
 
   return (
     <div className="rounded-xl border border-subtle overflow-hidden mb-6 shadow-lg">
@@ -339,11 +343,11 @@ function NavDashboard({ accounts, liveNav }: { accounts: Account[]; liveNav: num
         <div className="border-l border-accent/20">
           <AccountCard
             label="COMBINED"
-            nav={combinedNav > 0 ? combinedNav : null}
+            nav={combinedNav != null && combinedNav > 0 ? combinedNav : null}
             dailyPnl={null}
-            unrealizedPnl={combined.total_pnl}
+            unrealizedPnl={combined.has_pnl ? combined.total_pnl : null}
             buyingPower={null}
-            totalMargin={combined.total_margin}
+            totalMargin={combined.has_margin ? combined.total_margin : null}
             openPositions={combined.open_positions}
           />
         </div>
@@ -874,17 +878,19 @@ export default function Dashboard() {
   const [polling, setPolling]       = useState(false);
   const [tab, setTab]               = useState<"candidates" | "positions" | "exits">("candidates");
 
-  // Correction 1: data age derived from freshest candidate created_at
+  // Data age: freshest timestamp from candidates or positions, then health fallback
   const dataAgeSeconds = useMemo(() => {
-    if (candidates.length > 0) {
-      const freshestMs = Math.max(...candidates.map(c => new Date(c.created_at).getTime()));
-      return Math.floor((Date.now() - freshestMs) / 1000);
+    const timestamps: number[] = [];
+    candidates.forEach(c => { if (c.created_at) timestamps.push(new Date(c.created_at).getTime()); });
+    positions.forEach(p  => { if (p.opened_at)  timestamps.push(new Date(p.opened_at).getTime());  });
+    if (timestamps.length > 0) {
+      return Math.floor((Date.now() - Math.max(...timestamps)) / 1000);
     }
     if (health?.data_freshness?.last_snapshot_minutes_ago != null) {
       return health.data_freshness.last_snapshot_minutes_ago * 60;
     }
     return null;
-  }, [candidates, health]);
+  }, [candidates, positions, health]);
 
   const systemLevel: FreshnessLevel = useMemo(() => {
     if (dataAgeSeconds === null) return "unknown";
