@@ -117,6 +117,7 @@ def migrate_orders_schema(engine) -> None:
     ]
 
     # order_id added without FK — see module docstring note.
+    # source/close_reason added for reconciler.py (tracks how a position was opened/closed).
     _positions_add: list[tuple[str, str]] = [
         ("long_put_strike",   "NUMERIC"),
         ("short_put_strike",  "NUMERIC"),
@@ -125,6 +126,8 @@ def migrate_orders_schema(engine) -> None:
         ("quantity",          "INTEGER"),
         ("fill_credit",       "NUMERIC"),
         ("order_id",          "INTEGER"),
+        ("source",            "TEXT"),          # 'paper' | 'manual' | 'executor'
+        ("close_reason",      "TEXT"),          # 'manual_or_expired' | 'exit_signal' | …
     ]
 
     # Legacy NOT NULL columns that conflict with Phase 5 writes.
@@ -171,6 +174,16 @@ def migrate_orders_schema(engine) -> None:
                 conn.execute(text(
                     f"ALTER TABLE {table} ALTER COLUMN {col} {action}"
                 ))
+
+        # Unique index on positions.position_key — required for reconciler's
+        # ON CONFLICT (position_key) DO NOTHING INSERT.
+        # NULL values do not conflict with each other in a UNIQUE index (PostgreSQL
+        # semantics), so this is safe even for rows that pre-date position_key.
+        conn.execute(text("""
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_positions_position_key
+            ON positions (position_key)
+            WHERE position_key IS NOT NULL
+        """))
 
     logger.info("migrate_orders_schema: orders + positions schema verified/migrated")
 
