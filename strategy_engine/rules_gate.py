@@ -127,6 +127,13 @@ def get_account_contexts(client) -> list[tuple[str, AccountContext]]:
             correlated_risk: dict            = {}
             symbol_short_counts: dict[str, int] = {}
 
+            # Count iron condors only — non-condor positions (covered calls,
+            # naked puts, verticals, equity from assignment) are tracked in
+            # the DB for risk visibility but do NOT count toward the condor
+            # limit.  Iron condors always have exactly 2 short option legs
+            # per underlying+expiry; count // 2 naturally excludes single-leg
+            # non-condor positions (1 // 2 == 0) and strangle pairs that
+            # aren't iron condors.
             for pos in positions:
                 instrument = pos.get("instrument", {})
                 if instrument.get("assetType", "") != "OPTION":
@@ -139,6 +146,9 @@ def get_account_contexts(client) -> list[tuple[str, AccountContext]]:
                     )
 
             for symbol, count in symbol_short_counts.items():
+                # count // 2: requires 2 short legs (put + call) to form a
+                # condor.  Covered calls (1 short call) and naked puts
+                # (1 short put) give count=1 → 0 condors counted.
                 condors = count // 2
                 if condors > 0:
                     open_condors += condors

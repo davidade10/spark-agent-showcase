@@ -131,6 +131,8 @@ def migrate_orders_schema(engine) -> None:
         # Closure-hardening columns (Phase 5 safety)
         ("closure_strikes",      "INTEGER DEFAULT 0"),  # consecutive absences counter
         ("last_seen_in_schwab",  "TIMESTAMPTZ"),         # last confirmed-live timestamp
+        # Strategy generalisation (non-condor positions)
+        ("legs_json",            "JSONB"),               # raw leg data for non-standard strategies
     ]
 
     # Legacy NOT NULL columns that conflict with Phase 5 writes.

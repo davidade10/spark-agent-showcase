@@ -131,23 +131,68 @@ def _parse_schwab_positions(
     positions: list[dict],
     account_id: str,
     errors: list[str],
-) -> list[dict]:
+) -> tuple[list[dict], list[dict]]:
     """
-    Extract iron condor positions from the raw Schwab positions list for one
-    account.  Returns a list of parsed position dicts, one per condor.
+    Extract positions from raw Schwab data for one account.
+
+    Returns (condors, non_condors) — two separate lists so the caller can
+    distinguish strategies and update the parser health check accordingly.
+
+    Iron condor path is unchanged from before (byte-for-byte identical logic).
+    Non-condor path handles EQUITY, single-leg options, verticals, and other
+    multi-leg structures that are not 4-leg iron condors.
 
     Schwab's lightweight instrument block does not include underlyingSymbol or
     expirationDate; we parse the OCC symbol (instrument.symbol) to get root,
     expiry, put/call type, and strike, then group by (root, expiry).
     """
-    # Filter to OPTION positions only
+    # ── 0. Handle EQUITY positions first (shares from assignment, etc.) ───────
+    non_condors: list[dict] = []
+
+    for pos in positions:
+        instr = pos.get("instrument") or {}
+        if instr.get("assetType") != "EQUITY":
+            continue
+        symbol   = instr.get("symbol") or instr.get("cusip") or "UNKNOWN"
+        long_qty  = int(pos.get("longQuantity")  or 0)
+        short_qty = int(pos.get("shortQuantity") or 0)
+        quantity  = long_qty - short_qty
+        avg_price = None
+        for key in ("averageLongPrice", "averagePrice", "taxLotAverageLongPrice"):
+            v = pos.get(key)
+            if isinstance(v, (int, float)) and float(v) > 0:
+                avg_price = float(v)
+                break
+        position_key = f"{symbol}:EQUITY"
+        leg_detail = [{"symbol": symbol, "qty": quantity, "avg_price": avg_price}]
+        non_condors.append({
+            "symbol":             symbol,
+            "expiry":             None,
+            "strategy":           "EQUITY",
+            "quantity":           abs(quantity),
+            "fill_credit":        avg_price,
+            "account_id":         account_id,
+            "position_key":       position_key,
+            "legs_json":          json.dumps(leg_detail),
+            "long_put_strike":    None,
+            "short_put_strike":   None,
+            "short_call_strike":  None,
+            "long_call_strike":   None,
+            "legs":               1,     # leg count, used by health-check caller
+        })
+        logger.info(
+            f"reconciler: EQUITY {symbol} qty={quantity} "
+            f"avg_price={avg_price} account=...{account_id}"
+        )
+
+    # ── 1. Filter to OPTION positions only ────────────────────────────────────
     option_legs: list[dict] = []
     for pos in positions:
         instr = pos.get("instrument") or {}
         if instr.get("assetType") == "OPTION":
             option_legs.append(pos)
 
-    # Group by (underlying, expiry) using OCC symbol parsing
+    # ── 2. Group by (underlying, expiry) using OCC symbol parsing ─────────────
     groups: dict[tuple[str, str], list[dict]] = {}
     for pos in option_legs:
         instr = pos.get("instrument") or {}
@@ -156,20 +201,19 @@ def _parse_schwab_positions(
             logger.warning("reconciler: skipping leg with no instrument.symbol")
             continue
         try:
-            parsed = _parse_occ_symbol(occ_raw)
+            parsed_occ = _parse_occ_symbol(occ_raw)
         except ValueError as e:
             logger.warning(f"reconciler: skipping leg — OCC parse failed for {occ_raw!r}: {e}")
             continue
-        underlying = parsed["root"]
-        expiry = parsed["expiry"]
-        # Attach parsed data to the position for later use
-        pos["_occ"] = parsed
+        underlying = parsed_occ["root"]
+        expiry = parsed_occ["expiry"]
+        pos["_occ"] = parsed_occ
         groups.setdefault((underlying, expiry), []).append(pos)
 
-    parsed: list[dict] = []
+    condors: list[dict] = []
 
     for (underlying, expiry), legs in groups.items():
-        # Separate into long/short puts/calls
+        # ── Classify legs ─────────────────────────────────────────────────────
         long_puts:   list[dict] = []
         short_puts:  list[dict] = []
         long_calls:  list[dict] = []
@@ -177,8 +221,7 @@ def _parse_schwab_positions(
 
         for pos in legs:
             occ = pos.get("_occ") or {}
-            # Use OCC option_type (P/C); API may not return putCall in lightweight block
-            put_call = "PUT" if occ.get("option_type") == "P" else "CALL"
+            put_call  = "PUT" if occ.get("option_type") == "P" else "CALL"
             long_qty  = int(pos.get("longQuantity")  or 0)
             short_qty = int(pos.get("shortQuantity") or 0)
 
@@ -193,104 +236,200 @@ def _parse_schwab_positions(
                 elif short_qty > 0:
                     short_calls.append(pos)
 
-        # A valid iron condor needs exactly one of each leg
-        if not (len(long_puts) == len(short_puts) == len(long_calls) == len(short_calls) == 1):
-            if len(legs) > 0:
-                leg_summary = ", ".join(
-                    f"{(p.get('instrument') or {}).get('symbol')} "
-                    f"L={p.get('longQuantity')} S={p.get('shortQuantity')}"
-                    for p in legs
+        # ── Iron condor path (UNCHANGED) ─────────────────────────────────────
+        if len(long_puts) == len(short_puts) == len(long_calls) == len(short_calls) == 1:
+            lp_pos = long_puts[0]
+            sp_pos = short_puts[0]
+            lc_pos = long_calls[0]
+            sc_pos = short_calls[0]
+
+            lp_qty = int(lp_pos.get("longQuantity")  or 0)
+            sp_qty = int(sp_pos.get("shortQuantity") or 0)
+            lc_qty = int(lc_pos.get("longQuantity")  or 0)
+            sc_qty = int(sc_pos.get("shortQuantity") or 0)
+
+            # Trap 4 — assert all leg quantities are identical
+            if not (lp_qty == sp_qty == lc_qty == sc_qty) or lp_qty == 0:
+                leg_detail = (
+                    f"long_put={lp_qty} short_put={sp_qty} "
+                    f"long_call={lc_qty} short_call={sc_qty}"
                 )
+                msg = (
+                    f"reconciler: {underlying} {expiry} — "
+                    f"asymmetric leg quantities ({leg_detail}); "
+                    f"skipping — investigate naked risk"
+                )
+                logger.warning(msg)
+                errors.append(msg)
+                continue
+
+            quantity = lp_qty
+
+            def _strike(pos: dict) -> Optional[float]:
+                occ = pos.get("_occ")
+                if occ and "strike" in occ:
+                    return occ["strike"]
+                v = (pos.get("instrument") or {}).get("strikePrice")
+                return float(v) if v is not None else None
+
+            lp_strike = _strike(lp_pos)
+            sp_strike = _strike(sp_pos)
+            lc_strike = _strike(lc_pos)
+            sc_strike = _strike(sc_pos)
+
+            if any(s is None for s in (lp_strike, sp_strike, lc_strike, sc_strike)):
+                msg = (
+                    f"reconciler: {underlying} {expiry} — "
+                    "could not determine strikes; skipping"
+                )
+                logger.warning(msg)
+                errors.append(msg)
+                continue
+
+            # Trap 2 — compute fill_credit from individual leg avg prices
+            lp_avg = _leg_avg_price(lp_pos, +1)
+            sp_avg = _leg_avg_price(sp_pos, -1)
+            lc_avg = _leg_avg_price(lc_pos, +1)
+            sc_avg = _leg_avg_price(sc_pos, -1)
+
+            if all(x is not None for x in (lp_avg, sp_avg, lc_avg, sc_avg)):
+                fill_credit = round(sp_avg + sc_avg - lp_avg - lc_avg, 4)
+            else:
+                fill_credit = None
                 logger.warning(
                     f"reconciler: {underlying} {expiry} — "
-                    f"incomplete/non-condor group ({len(legs)} legs): {leg_summary}"
+                    f"could not compute fill_credit (missing leg avg prices); "
+                    f"inserting with fill_credit=NULL"
                 )
-            continue
 
-        lp_pos = long_puts[0]
-        sp_pos = short_puts[0]
-        lc_pos = long_calls[0]
-        sc_pos = short_calls[0]
-
-        lp_qty = int(lp_pos.get("longQuantity")  or 0)
-        sp_qty = int(sp_pos.get("shortQuantity") or 0)
-        lc_qty = int(lc_pos.get("longQuantity")  or 0)
-        sc_qty = int(sc_pos.get("shortQuantity") or 0)
-
-        # Trap 4 — assert all leg quantities are identical
-        if not (lp_qty == sp_qty == lc_qty == sc_qty) or lp_qty == 0:
-            leg_detail = (
-                f"long_put={lp_qty} short_put={sp_qty} "
-                f"long_call={lc_qty} short_call={sc_qty}"
+            # Iron condor position_key — PRESERVED EXACTLY (backward compat)
+            position_key = (
+                f"{underlying}:{expiry}:"
+                f"{lp_strike}-{sp_strike}:{sc_strike}-{lc_strike}:{quantity}"
             )
-            msg = (
-                f"reconciler: {underlying} {expiry} — "
-                f"asymmetric leg quantities ({leg_detail}); "
-                f"skipping — investigate naked risk"
-            )
-            logger.warning(msg)
-            errors.append(msg)
-            continue
 
-        quantity = lp_qty
+            condors.append({
+                "symbol":            underlying,
+                "expiry":            expiry,
+                "strategy":          "IRON_CONDOR",
+                "long_put_strike":   lp_strike,
+                "short_put_strike":  sp_strike,
+                "short_call_strike": sc_strike,
+                "long_call_strike":  lc_strike,
+                "quantity":          quantity,
+                "fill_credit":       fill_credit,
+                "account_id":        account_id,
+                "position_key":      position_key,
+                "legs_json":         None,
+                "legs":              4,  # leg count for health-check
+            })
+            continue  # handled as condor — skip non-condor path
 
-        # Strikes from OCC-parsed data (lightweight API often omits strikePrice)
-        def _strike(pos: dict) -> Optional[float]:
+        # ── Non-condor option path ─────────────────────────────────────────────
+        all_legs = long_puts + short_puts + long_calls + short_calls
+        n_legs   = len(all_legs)
+
+        def _occ_strike(pos: dict) -> Optional[float]:
             occ = pos.get("_occ")
             if occ and "strike" in occ:
                 return occ["strike"]
             v = (pos.get("instrument") or {}).get("strikePrice")
             return float(v) if v is not None else None
 
-        lp_strike = _strike(lp_pos)
-        sp_strike = _strike(sp_pos)
-        lc_strike = _strike(lc_pos)
-        sc_strike = _strike(sc_pos)
+        # Build leg details for legs_json
+        leg_details = []
+        for pos in all_legs:
+            occ = pos.get("_occ") or {}
+            leg_details.append({
+                "occ_symbol": (pos.get("instrument") or {}).get("symbol"),
+                "option_type": occ.get("option_type"),
+                "strike":      occ.get("strike"),
+                "long_qty":    int(pos.get("longQuantity")  or 0),
+                "short_qty":   int(pos.get("shortQuantity") or 0),
+            })
 
-        if any(s is None for s in (lp_strike, sp_strike, lc_strike, sc_strike)):
-            msg = (
-                f"reconciler: {underlying} {expiry} — "
-                "could not determine strikes; skipping"
-            )
-            logger.warning(msg)
-            errors.append(msg)
-            continue
+        # Determine strategy
+        strategy = "UNKNOWN"
+        if n_legs == 1:
+            pos = all_legs[0]
+            occ = pos.get("_occ") or {}
+            long_qty  = int(pos.get("longQuantity")  or 0)
+            short_qty = int(pos.get("shortQuantity") or 0)
+            if short_qty > 0:
+                strategy = "SHORT_OPTION"
+            elif long_qty > 0:
+                strategy = "LONG_OPTION"
+        elif n_legs == 2 and len(all_legs) == 2:
+            has_long  = len(long_puts) + len(long_calls) == 1
+            has_short = len(short_puts) + len(short_calls) == 1
+            if has_long and has_short:
+                # Same type → vertical spread; different types → strangle/straddle
+                same_type = (
+                    (len(long_puts) == 1 and len(short_puts) == 1) or
+                    (len(long_calls) == 1 and len(short_calls) == 1)
+                )
+                if same_type:
+                    strategy = "VERTICAL_SPREAD"
+                else:
+                    strikes = [_occ_strike(p) for p in all_legs]
+                    if all(s is not None for s in strikes) and math.isclose(
+                        float(strikes[0]), float(strikes[1]), abs_tol=0.01  # type: ignore[arg-type]
+                    ):
+                        strategy = "STRADDLE"
+                    else:
+                        strategy = "STRANGLE"
 
-        # Trap 2 — compute fill_credit from individual leg avg prices
-        lp_avg = _leg_avg_price(lp_pos, +1)
-        sp_avg = _leg_avg_price(sp_pos, -1)
-        lc_avg = _leg_avg_price(lc_pos, +1)
-        sc_avg = _leg_avg_price(sc_pos, -1)
+        # Quantity: use the first leg's non-zero qty
+        quantity = 0
+        fill_credit = None
+        for pos in all_legs:
+            lq = int(pos.get("longQuantity")  or 0)
+            sq = int(pos.get("shortQuantity") or 0)
+            if lq > 0:
+                quantity = lq
+            elif sq > 0:
+                quantity = sq
+            avg = _leg_avg_price(pos, -sq if sq > 0 else lq)
+            if avg is not None and fill_credit is None:
+                fill_credit = avg if sq > 0 else -avg  # credit positive for shorts
 
-        if all(x is not None for x in (lp_avg, sp_avg, lc_avg, sc_avg)):
-            fill_credit = round(sp_avg + sc_avg - lp_avg - lc_avg, 4)
-        else:
-            fill_credit = None
-            logger.warning(
-                f"reconciler: {underlying} {expiry} — "
-                f"could not compute fill_credit (missing leg avg prices); "
-                f"inserting with fill_credit=NULL"
-            )
+        # Populate only the available strike columns
+        sc_strike = _occ_strike(short_calls[0]) if short_calls else None
+        sp_strike = _occ_strike(short_puts[0])  if short_puts  else None
+        lc_strike = _occ_strike(long_calls[0])  if long_calls  else None
+        lp_strike = _occ_strike(long_puts[0])   if long_puts   else None
 
+        # Position key for non-condors — includes strategy to avoid collision
+        strike_parts = [
+            str(s) for s in (lp_strike, sp_strike, sc_strike, lc_strike)
+            if s is not None
+        ]
         position_key = (
-            f"{underlying}:{expiry}:"
-            f"{lp_strike}-{sp_strike}:{sc_strike}-{lc_strike}:{quantity}"
+            f"{underlying}_{expiry}_{strategy}_"
+            + ("-".join(strike_parts) if strike_parts else "nostrike")
         )
 
-        parsed.append({
+        non_condors.append({
             "symbol":            underlying,
             "expiry":            expiry,
-            "long_put_strike":   lp_strike,
-            "short_put_strike":  sp_strike,
-            "short_call_strike": sc_strike,
-            "long_call_strike":  lc_strike,
+            "strategy":          strategy,
             "quantity":          quantity,
             "fill_credit":       fill_credit,
             "account_id":        account_id,
             "position_key":      position_key,
+            "legs_json":         json.dumps(leg_details),
+            "long_put_strike":   lp_strike,
+            "short_put_strike":  sp_strike,
+            "short_call_strike": sc_strike,
+            "long_call_strike":  lc_strike,
+            "legs":              n_legs,  # leg count for health-check
         })
+        logger.info(
+            f"reconciler: non-condor {strategy} {underlying} {expiry} "
+            f"qty={quantity} account=...{account_id}"
+        )
 
-    return parsed
+    return condors, non_condors
 
 
 # ── DB position matcher ───────────────────────────────────────────────────────
@@ -300,18 +439,43 @@ def _match_position(
     db_positions: list[dict],
 ) -> Optional[dict]:
     """
-    Find the DB row matching a parsed Schwab position by symbol, expiry,
-    and all four strikes.
+    Find the DB row matching a parsed Schwab position.
+
+    Matching rules by strategy:
+      IRON_CONDOR    — symbol + expiry + all four strikes (unchanged, Traps 5+6)
+      VERTICAL_SPREAD/STRANGLE/STRADDLE — symbol + expiry + strategy + non-null strikes
+      SHORT_OPTION/LONG_OPTION — symbol + expiry + strategy + the one populated strike
+      EQUITY         — symbol + strategy only (no expiry or strikes)
 
     Uses math.isclose(abs_tol=0.01) for all strike comparisons (Trap 5).
     Normalises expiry to YYYY-MM-DD before comparing (Trap 6).
     Returns the matching DB dict or None.
     """
-    sym    = schwab_pos["symbol"]
-    expiry = schwab_pos["expiry"]   # already normalised
+    def _close(a, b) -> bool:
+        if a is None or b is None:
+            return False
+        return math.isclose(float(a), float(b), abs_tol=0.01)
+
+    sym      = schwab_pos["symbol"]
+    strategy = schwab_pos.get("strategy", "IRON_CONDOR")
+
+    # EQUITY: match by symbol + strategy only
+    if strategy == "EQUITY":
+        for db in db_positions:
+            if db.get("symbol") == sym and db.get("strategy") == "EQUITY":
+                return db
+        return None
+
+    expiry = schwab_pos.get("expiry")  # already normalised
 
     for db in db_positions:
         if db.get("symbol") != sym:
+            continue
+
+        # Strategy must match for non-condor rows (condor rows may have NULL strategy
+        # in legacy data, so only enforce for non-condors)
+        db_strategy = db.get("strategy") or "IRON_CONDOR"
+        if strategy != "IRON_CONDOR" and db_strategy != strategy:
             continue
 
         db_expiry = db.get("expiry")
@@ -324,18 +488,36 @@ def _match_position(
         if db_expiry_str != expiry:
             continue
 
-        def _close(a, b) -> bool:
-            if a is None or b is None:
-                return False
-            return math.isclose(float(a), float(b), abs_tol=0.01)
-
-        if (
-            _close(schwab_pos["long_put_strike"],   db.get("long_put_strike"))
-            and _close(schwab_pos["short_put_strike"],  db.get("short_put_strike"))
-            and _close(schwab_pos["short_call_strike"], db.get("short_call_strike"))
-            and _close(schwab_pos["long_call_strike"],  db.get("long_call_strike"))
-        ):
-            return db
+        if strategy == "IRON_CONDOR":
+            # Original condor matching — all four strikes must match
+            if (
+                _close(schwab_pos["long_put_strike"],   db.get("long_put_strike"))
+                and _close(schwab_pos["short_put_strike"],  db.get("short_put_strike"))
+                and _close(schwab_pos["short_call_strike"], db.get("short_call_strike"))
+                and _close(schwab_pos["long_call_strike"],  db.get("long_call_strike"))
+            ):
+                return db
+        else:
+            # Non-condor: match on whichever strike columns are non-null in the
+            # Schwab position; skip columns where Schwab has None
+            strike_cols = (
+                "long_put_strike", "short_put_strike",
+                "short_call_strike", "long_call_strike",
+            )
+            all_match = True
+            any_strike_checked = False
+            for col in strike_cols:
+                sw_val = schwab_pos.get(col)
+                if sw_val is None:
+                    continue  # not populated for this strategy — skip
+                any_strike_checked = True
+                if not _close(sw_val, db.get(col)):
+                    all_match = False
+                    break
+            # For strategies where no strikes are populated (shouldn't happen
+            # for options), fall through without matching to avoid false positives
+            if all_match and (any_strike_checked or strategy == "EQUITY"):
+                return db
 
     return None
 
@@ -431,42 +613,53 @@ def reconcile(engine, schwab_client) -> dict:
         raw_positions = (
             data.get("securitiesAccount", {}).get("positions") or []
         )
-        # Count OPTION legs for parser health check
+        # Count OPTION legs only — equity positions excluded from health check
         option_legs = sum(
             1 for p in raw_positions
             if (p.get("instrument") or {}).get("assetType") == "OPTION"
         )
         total_legs_received += option_legs
 
-        parsed = _parse_schwab_positions(raw_positions, last4, summary["errors"])
-        total_condors_parsed += len(parsed)
+        condors, non_condors = _parse_schwab_positions(
+            raw_positions, last4, summary["errors"]
+        )
+        total_condors_parsed += len(condors)
         logger.info(
             f"reconcile: account ...{last4} — "
-            f"{option_legs} option legs → {len(parsed)} iron condors parsed"
+            f"{option_legs} option legs → {len(condors)} condors, "
+            f"{len(non_condors)} non-condor positions parsed"
         )
-        all_schwab_positions.extend(parsed)
+        all_schwab_positions.extend(condors)
+        all_schwab_positions.extend(non_condors)
 
     # ── Parser health check — block closures if parser looks broken ───────────
-    skipped_legs = total_legs_received - (total_condors_parsed * 4)
-    summary["skipped_legs"] = max(0, skipped_legs)
+    # Only count OPTION legs as "recognized" when they become condors or
+    # non-condor option strategies.  EQUITY positions never were option legs.
+    recognized_option_legs = total_condors_parsed * 4 + sum(
+        p.get("legs", 0)
+        for p in all_schwab_positions
+        if p.get("strategy") not in ("IRON_CONDOR", "EQUITY")
+    )
+    skipped_legs = max(0, total_legs_received - recognized_option_legs)
+    summary["skipped_legs"] = skipped_legs
     closures_blocked = False
 
     if total_legs_received >= 4:
-        expected_condors = total_legs_received / 4
-        parse_ratio = total_condors_parsed / expected_condors
+        recognized_total = total_legs_received - skipped_legs
+        parse_ratio = recognized_total / total_legs_received
 
-        if total_condors_parsed == 0:
+        if recognized_total == 0:
             msg = (
-                f"Parser produced 0 condors from {total_legs_received} legs — "
-                "closure writes BLOCKED for safety. Investigate parser."
+                f"Parser produced 0 recognized positions from {total_legs_received} "
+                "option legs — closure writes BLOCKED for safety. Investigate parser."
             )
             logger.critical(msg)
             summary["errors"].append(msg)
             closures_blocked = True
         elif parse_ratio < 0.5:
             msg = (
-                f"Parser health WARNING: parsed {total_condors_parsed} condors "
-                f"from {total_legs_received} legs (ratio={parse_ratio:.2f} < 0.5) — "
+                f"Parser health WARNING: recognized {recognized_total} of "
+                f"{total_legs_received} option legs (ratio={parse_ratio:.2f} < 0.5) — "
                 "closure writes BLOCKED for safety."
             )
             logger.warning(msg)
@@ -498,54 +691,59 @@ def reconcile(engine, schwab_client) -> dict:
             if db_match is None:
                 # In Schwab but not in DB → insert as source='manual'
                 dte = None
-                try:
-                    from datetime import date as _date
-                    exp_date = dateutil_parser.parse(sp["expiry"]).date()
-                    dte = (exp_date - datetime.now(timezone.utc).date()).days
-                except Exception:
-                    pass
+                sp_expiry = sp.get("expiry")
+                if sp_expiry:
+                    try:
+                        exp_date = dateutil_parser.parse(sp_expiry).date()
+                        dte = (exp_date - datetime.now(timezone.utc).date()).days
+                    except Exception:
+                        pass
 
                 conn.execute(text("""
                     INSERT INTO positions (
                         account_id, symbol, expiry, strategy,
                         long_put_strike, short_put_strike,
                         short_call_strike, long_call_strike,
-                        quantity, fill_credit,
+                        quantity, fill_credit, legs_json,
                         opened_at, status, source, position_key, dte
                     ) VALUES (
-                        :account_id, :symbol, :expiry, 'IRON_CONDOR',
+                        :account_id, :symbol, :expiry, :strategy,
                         :long_put_strike, :short_put_strike,
                         :short_call_strike, :long_call_strike,
-                        :quantity, :fill_credit,
+                        :quantity, :fill_credit, :legs_json,
                         :opened_at, 'open', 'manual', :position_key, :dte
                     )
                     ON CONFLICT (position_key) DO NOTHING
                 """), {
                     "account_id":        sp["account_id"],
                     "symbol":            sp["symbol"],
-                    "expiry":            sp["expiry"],
-                    "long_put_strike":   sp["long_put_strike"],
-                    "short_put_strike":  sp["short_put_strike"],
-                    "short_call_strike": sp["short_call_strike"],
-                    "long_call_strike":  sp["long_call_strike"],
+                    "expiry":            sp.get("expiry"),
+                    "strategy":          sp.get("strategy", "IRON_CONDOR"),
+                    "long_put_strike":   sp.get("long_put_strike"),
+                    "short_put_strike":  sp.get("short_put_strike"),
+                    "short_call_strike": sp.get("short_call_strike"),
+                    "long_call_strike":  sp.get("long_call_strike"),
                     "quantity":          sp["quantity"],
-                    "fill_credit":       sp["fill_credit"],
+                    "fill_credit":       sp.get("fill_credit"),
+                    "legs_json":         sp.get("legs_json"),
                     "opened_at":         now,
                     "position_key":      sp["position_key"],
                     "dte":               dte,
                 })
                 entry = {
-                    "symbol":   sp["symbol"],
-                    "expiry":   sp["expiry"],
-                    "account":  sp["account_id"],
-                    "quantity": sp["quantity"],
-                    "fill_credit": sp["fill_credit"],
+                    "symbol":    sp["symbol"],
+                    "expiry":    sp.get("expiry"),
+                    "strategy":  sp.get("strategy", "IRON_CONDOR"),
+                    "account":   sp["account_id"],
+                    "quantity":  sp["quantity"],
+                    "fill_credit": sp.get("fill_credit"),
                 }
                 summary["inserted"].append(entry)
                 logger.info(
-                    f"reconcile: INSERTED {sp['symbol']} {sp['expiry']} "
+                    f"reconcile: INSERTED {sp['symbol']} {sp.get('expiry', 'n/a')} "
+                    f"strategy={sp.get('strategy','IRON_CONDOR')} "
                     f"account=...{sp['account_id']} qty={sp['quantity']} "
-                    f"fill_credit={sp['fill_credit']} source=manual"
+                    f"fill_credit={sp.get('fill_credit')} source=manual"
                 )
 
             else:
