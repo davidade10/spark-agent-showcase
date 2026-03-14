@@ -37,6 +37,7 @@ from sqlalchemy import create_engine, text
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from config import DB_HOST, DB_PORT, DB_NAME, DB_USER, DB_PASSWORD
 from execution.executor import execute_approved_candidate
+from execution.order_state import migrate_orders_schema
 
 logger = logging.getLogger(__name__)
 
@@ -55,56 +56,14 @@ def get_engine():
     return create_engine(DB_URL, pool_pre_ping=True)
 
 
-# ── Execution table bootstrap ─────────────────────────────────────────────────
-# Ensures orders and positions tables exist before the first approve click.
-# Mirrors the schemas in executor.py and dry_run.py.
-
-_CREATE_ORDERS = """
-CREATE TABLE IF NOT EXISTS orders (
-    id            SERIAL PRIMARY KEY,
-    candidate_id  INTEGER,
-    account_id    TEXT,
-    symbol        TEXT,
-    status        TEXT        DEFAULT 'pending',
-    source        TEXT        DEFAULT 'paper',
-    order_payload JSONB,
-    fill_price    NUMERIC,
-    quantity      INTEGER,
-    created_at    TIMESTAMPTZ DEFAULT now(),
-    filled_at     TIMESTAMPTZ
-);
-"""
-
-_CREATE_POSITIONS = """
-CREATE TABLE IF NOT EXISTS positions (
-    id                 SERIAL PRIMARY KEY,
-    account_id         TEXT,
-    symbol             TEXT,
-    expiry             DATE,
-    strategy           TEXT        DEFAULT 'IRON_CONDOR',
-    long_put_strike    NUMERIC,
-    short_put_strike   NUMERIC,
-    short_call_strike  NUMERIC,
-    long_call_strike   NUMERIC,
-    quantity           INTEGER,
-    fill_credit        NUMERIC,
-    opened_at          TIMESTAMPTZ DEFAULT now(),
-    status             TEXT        DEFAULT 'open',
-    order_id           INTEGER     REFERENCES orders(id)
-);
-"""
-
-
 @app.on_event("startup")
 def ensure_execution_tables():
+    """Run the idempotent schema migration on every startup."""
     try:
-        engine = get_engine()
-        with engine.begin() as conn:
-            conn.execute(text(_CREATE_ORDERS))
-            conn.execute(text(_CREATE_POSITIONS))
+        migrate_orders_schema(get_engine())
         logger.info("Execution tables verified (orders, positions)")
     except Exception as e:
-        logger.error(f"Failed to ensure execution tables on startup: {e}")
+        logger.error(f"Failed to migrate execution tables on startup: {e}")
 
 
 # ── Models ────────────────────────────────────────────────────────────────────
@@ -272,7 +231,7 @@ def get_positions():
     with engine.connect() as conn:
         rows = conn.execute(text("""
             SELECT id, account_id, symbol, strategy, expiry, dte,
-                   entry_credit, net_delta, unrealized_pnl,
+                   fill_credit, net_delta, unrealized_pnl,
                    opened_at, status, legs, meta,
                    max_risk, position_key
             FROM positions
@@ -284,10 +243,15 @@ def get_positions():
         d = _serialize(r)
         d["legs"] = _parse_jsonb(d.get("legs"))
         d["meta"] = _parse_jsonb(d.get("meta"))
+        # Credit: paper uses fill_credit; expose for "Credit received", and as entry_credit for compat
+        credit = d.get("fill_credit")
+        if credit is not None:
+            d["fill_credit"] = float(credit)
+            d["entry_credit"] = d["fill_credit"]
         # Compute profit pct if we have the data
-        if d.get("entry_credit") and d.get("unrealized_pnl") is not None:
+        if credit is not None and d.get("unrealized_pnl") is not None:
             try:
-                d["profit_pct"] = round(float(d["unrealized_pnl"]) / float(d["entry_credit"]) * 100, 1)
+                d["profit_pct"] = round(float(d["unrealized_pnl"]) / float(credit) * 100, 1)
             except Exception:
                 d["profit_pct"] = None
         else:

@@ -26,33 +26,6 @@ logger = logging.getLogger(__name__)
 
 DB_URL = f"postgresql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
 
-# ── Schema bootstrap ──────────────────────────────────────────────────────────
-# positions references orders(id) — orders table is created by executor.py
-# before simulate_fill is ever called, so the FK constraint is safe.
-_CREATE_POSITIONS = """
-CREATE TABLE IF NOT EXISTS positions (
-    id                 SERIAL PRIMARY KEY,
-    account_id         TEXT,
-    symbol             TEXT,
-    expiry             DATE,
-    strategy           TEXT        DEFAULT 'IRON_CONDOR',
-    long_put_strike    NUMERIC,
-    short_put_strike   NUMERIC,
-    short_call_strike  NUMERIC,
-    long_call_strike   NUMERIC,
-    quantity           INTEGER,
-    fill_credit        NUMERIC,
-    opened_at          TIMESTAMPTZ DEFAULT now(),
-    status             TEXT        DEFAULT 'open',
-    order_id           INTEGER     REFERENCES orders(id)
-);
-"""
-
-
-def _ensure_schema(conn) -> None:
-    conn.execute(text(_CREATE_POSITIONS))
-
-
 # ── Helpers ───────────────────────────────────────────────────────────────────
 def _get_latest_snapshot_id(conn) -> Optional[int]:
     row = conn.execute(text("""
@@ -117,8 +90,6 @@ def simulate_fill(candidate_json: dict, quantity: int, order_id: int) -> int:
     engine = create_engine(DB_URL)
 
     with engine.begin() as conn:
-        _ensure_schema(conn)
-
         symbol     = candidate_json["symbol"]
         expiry     = candidate_json["expiry"]
         net_credit = float(candidate_json["net_credit"])

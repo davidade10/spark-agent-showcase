@@ -23,6 +23,7 @@ from config import (
     DB_HOST, DB_PORT, DB_NAME, DB_USER, DB_PASSWORD,
     HARD_RULES, TRADING_MODE,
 )
+from execution.order_state import migrate_orders_schema
 
 load_dotenv()
 
@@ -44,28 +45,6 @@ if TRADING_MODE == "live":
         "TRADING_MODE=live — real orders will be sent to Schwab. "
         "Complete Phase 5 live sign-off before enabling live execution."
     )
-
-# ── Schema bootstrap ──────────────────────────────────────────────────────────
-_CREATE_ORDERS = """
-CREATE TABLE IF NOT EXISTS orders (
-    id            SERIAL PRIMARY KEY,
-    candidate_id  INTEGER,
-    account_id    TEXT,
-    symbol        TEXT,
-    status        TEXT        DEFAULT 'pending',
-    source        TEXT        DEFAULT 'paper',
-    order_payload JSONB,
-    fill_price    NUMERIC,
-    quantity      INTEGER,
-    created_at    TIMESTAMPTZ DEFAULT now(),
-    filled_at     TIMESTAMPTZ
-);
-"""
-
-
-def _ensure_schema(conn) -> None:
-    conn.execute(text(_CREATE_ORDERS))
-
 
 # ── Payload builder ───────────────────────────────────────────────────────────
 def build_iron_condor_payload(candidate_json: dict, quantity: int) -> dict:
@@ -179,10 +158,9 @@ def execute_approved_candidate(candidate_id: int) -> int:
     from execution.dry_run import simulate_fill  # noqa: PLC0415
 
     engine = create_engine(DB_URL)
+    migrate_orders_schema(engine)
 
     with engine.begin() as conn:
-        _ensure_schema(conn)
-
         # 1. Load trade_candidate row
         row = conn.execute(text("""
             SELECT id, symbol, candidate_json, llm_card, account_id
