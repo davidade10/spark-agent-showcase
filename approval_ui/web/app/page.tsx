@@ -1,11 +1,11 @@
 "use client";
 
-import { useEffect, useState, useCallback } from "react";
+import { useEffect, useState, useCallback, useMemo } from "react";
 import axios from "axios";
 import {
   AlertTriangle, CheckCircle, XCircle, Clock, TrendingUp,
-  Shield, Zap, RefreshCw, ChevronDown, ChevronUp,
-  Activity, BarChart2, BellOff, Trash2, DollarSign
+  RefreshCw, ChevronDown, ChevronUp,
+  Activity, BellOff, Trash2
 } from "lucide-react";
 
 const API = "http://localhost:8000";
@@ -48,6 +48,7 @@ interface Position {
   net_delta: number; max_risk: number; opened_at: string;
   legs: any; meta: any; position_key: string;
   qty?: number;
+  mark?: number | null;
 }
 
 interface ExitSignal {
@@ -74,24 +75,72 @@ interface Health {
   token?: { valid: boolean; days_remaining: number };
 }
 
-// ── Helpers ───────────────────────────────────────────────────────────────────
+// ── Freshness helpers ─────────────────────────────────────────────────────────
 
-const recLabel = (rec: string) => rec.toUpperCase();
+type FreshnessLevel = "live" | "delayed" | "stale" | "unknown";
+
+function getFreshnessLevel(minutesAgo: number | null): FreshnessLevel {
+  if (minutesAgo === null) return "unknown";
+  if (minutesAgo < 2) return "live";
+  if (minutesAgo < 15) return "delayed";
+  return "stale";
+}
+
+function formatAge(minutesAgo: number | null): string {
+  if (minutesAgo === null) return "unknown";
+  if (minutesAgo < 1) return "<1m ago";
+  return `${minutesAgo}m ago`;
+}
+
+function formatDataAge(seconds: number | null): string {
+  if (seconds === null) return "--";
+  if (seconds < 60) return `${seconds}s ago`;
+  if (seconds < 3600) return `${Math.floor(seconds / 60)}m ago`;
+  return `${Math.floor(seconds / 3600)}h ago`;
+}
+
+// ── Position status chip (Correction 4) ──────────────────────────────────────
+
+type StatusChip = "TARGET" | "DANGER" | "WATCH" | "HOLD";
+
+function getChip(
+  mark: number | null | undefined,
+  fillCredit: number | null | undefined,
+  dte: number | null,
+): StatusChip {
+  if (mark != null && fillCredit != null) {
+    if (mark <= fillCredit * 0.5) return "TARGET";
+    if (mark >= fillCredit * 2.0) return "DANGER";
+  }
+  if (dte != null && dte < 14) return "WATCH";
+  return "HOLD";
+}
+
+const chipStyle: Record<StatusChip, string> = {
+  TARGET: "text-success bg-positive/10",
+  DANGER: "text-danger  bg-negative/10",
+  WATCH:  "text-warning bg-warning/10",
+  HOLD:   "text-tertiary bg-white/5",
+};
+
+// ── Candidate helpers ─────────────────────────────────────────────────────────
+
+const recLabel    = (rec: string) => rec.toUpperCase();
 const recTextColor = (rec: string) => rec === "yes" ? "text-emerald-400" : rec === "no" ? "text-red-400" : "text-amber-400";
-const recBorderBg = (rec: string) => rec === "yes"
+const recBorderBg  = (rec: string) => rec === "yes"
   ? "border-emerald-500/30 bg-emerald-500/5"
   : rec === "no"
     ? "border-red-500/30 bg-red-500/5"
     : "border-amber-500/30 bg-amber-500/5";
-const recBadgeBg = (rec: string) => rec === "yes"
+const recBadgeBg   = (rec: string) => rec === "yes"
   ? "bg-emerald-400 text-black"
   : rec === "no"
     ? "bg-red-500 text-white"
     : "bg-amber-400 text-black";
 
-const scoreColor = (s: number) => s >= 70 ? "text-emerald-400" : s >= 50 ? "text-amber-400" : "text-red-400";
+const scoreColor    = (s: number) => s >= 70 ? "text-emerald-400" : s >= 50 ? "text-amber-400" : "text-red-400";
 const scoreBarColor = (s: number) => s >= 70 ? "bg-emerald-400" : s >= 50 ? "bg-amber-400" : "bg-red-400";
-const confPct = (c: number) => `${Math.round((c ?? 0) * 100)}%`;
+const confPct  = (c: number) => `${Math.round((c ?? 0) * 100)}%`;
 
 function pop(putDelta: number, callDelta: number): string {
   const p = Math.max(0, Math.min(100, (1 - Math.abs(putDelta) - Math.abs(callDelta)) * 100));
@@ -102,137 +151,201 @@ function rr(credit: number, maxLoss: number): string {
   return `1:${(maxLoss / credit).toFixed(2)}`;
 }
 
-// ── Status Bar ────────────────────────────────────────────────────────────────
+// ── Correction 1: Operator Bar ───────────────────────────────────────────────
 
-function StatusBar({ health }: { health: Health | null }) {
-  if (!health) return null;
-  const cb = health.circuit_breaker;
-  const fresh = health.data_freshness;
-  const token = health.token;
+function OperatorBar({ dataAgeSeconds, systemLevel, openCount, pendingCount, polling, onRefresh }: {
+  dataAgeSeconds: number | null;
+  systemLevel: FreshnessLevel;
+  openCount: number;
+  pendingCount: number;
+  polling: boolean;
+  onRefresh: () => void;
+}) {
+  const dotColor: Record<FreshnessLevel, string> = {
+    live:    "text-positive",
+    delayed: "text-warning",
+    stale:   "text-danger",
+    unknown: "text-tertiary",
+  };
+  const systemLabel: Record<FreshnessLevel, string> = {
+    live:    "LIVE",
+    delayed: "DELAYED",
+    stale:   "STALE",
+    unknown: "—",
+  };
+
   return (
-    <div className="flex items-center gap-6 px-6 py-2 bg-zinc-900/80 border-b border-zinc-800 text-xs font-mono">
-      <span className={`flex items-center gap-1.5 ${cb?.state === "closed" ? "text-emerald-400" : "text-red-400"}`}>
-        <Zap size={10} />
-        LLM {cb?.state === "closed" ? "ONLINE" : "TRIPPED"}
-        {cb?.attempts > 0 && <span className="text-zinc-600 ml-1">{cb?.failures}/{cb?.attempts} fail</span>}
-      </span>
-      <span className={`flex items-center gap-1.5 ${fresh?.is_stale ? "text-amber-400" : "text-emerald-400"}`}>
-        <Activity size={10} />
-        {fresh?.last_snapshot_minutes_ago !== null
-          ? `DATA ${fresh?.is_stale ? "STALE" : "LIVE"} · ${fresh?.last_snapshot_minutes_ago}m ago`
-          : "NO SNAPSHOTS"}
-      </span>
-      {token && (
-        <span className={`flex items-center gap-1.5 ${token.valid && token.days_remaining > 1 ? "text-zinc-500" : "text-red-400"}`}>
-          <Shield size={10} />
-          TOKEN {token.valid ? `${token.days_remaining}d` : "EXPIRED"}
+    <div className="h-10 flex items-center justify-between px-6 bg-card border-b border-subtle font-mono text-xs">
+      {/* Left — brand */}
+      <div className="flex items-center gap-2.5">
+        <Activity size={13} className="text-positive" />
+        <span className="font-black tracking-widest text-primary">SPARK</span>
+        <span className="text-tertiary hidden sm:inline">/ Iron Condor Desk</span>
+      </div>
+
+      {/* Right — operational fields separated by dividers */}
+      <div className="flex items-center divide-x divide-subtle">
+        <span className={`flex items-center gap-1.5 pr-4 ${dotColor[systemLevel]}`}>
+          <span>●</span>
+          System: <span className="font-bold ml-0.5">{systemLabel[systemLevel]}</span>
         </span>
-      )}
+        <span className="text-secondary px-4">
+          Data: <span className="text-primary">{formatDataAge(dataAgeSeconds)}</span>
+        </span>
+        <span className="text-secondary px-4">
+          <span className="text-primary font-bold">{openCount}</span> Open
+        </span>
+        <span className="text-secondary px-4">
+          <span className="text-primary font-bold">{pendingCount}</span> Pending
+        </span>
+        <span className="text-tertiary px-4">0 Alerts</span>
+        <span className="text-tertiary px-4">Reconciled: --</span>
+        <button
+          onClick={onRefresh}
+          className="flex items-center gap-1 pl-4 text-secondary hover:text-primary transition-colors"
+        >
+          <RefreshCw size={10} className={polling ? "animate-spin" : ""} />
+          REFRESH
+        </button>
+      </div>
     </div>
   );
 }
 
-// ── NAV Dashboard ─────────────────────────────────────────────────────────────
+// ── NAV Dashboard (Correction 3: 4-row layout) ───────────────────────────────
+
+function AccountCard({ label, accountId, nav, dailyPnl, unrealizedPnl, buyingPower, totalMargin, openPositions, isLive }: {
+  label: string;
+  accountId?: string;
+  nav: number | null;
+  dailyPnl?: number | null;
+  unrealizedPnl: number;
+  buyingPower?: number | null;
+  totalMargin: number;
+  openPositions: number;
+  isLive?: boolean;
+}) {
+  const navStr = nav != null
+    ? new Intl.NumberFormat("en-US", { style: "currency", currency: "USD" }).format(nav)
+    : "—";
+  const marginPct = nav != null && nav > 0 ? (totalMargin / nav) * 100 : null;
+
+  return (
+    <div className={`p-5 card-surface rounded-none border-0 font-mono ${isLive ? "bg-blue-950/10" : ""}`}>
+      {/* Row 1: Label + NAV */}
+      <div className="flex items-start justify-between mb-3">
+        <div>
+          <div className="text-[10px] text-tertiary uppercase">{label}</div>
+          {accountId && (
+            <div className={`text-xs mt-0.5 ${isLive ? "text-info" : "text-secondary"}`}>
+              ···{accountId.slice(-4)}
+            </div>
+          )}
+        </div>
+        <div className="text-right">
+          <div className="text-xl font-black text-primary">{navStr}</div>
+          <div className="text-[10px] text-tertiary">NAV</div>
+        </div>
+      </div>
+
+      {/* Row 2: Daily P/L | Unrealized P/L */}
+      <div className="grid grid-cols-2 gap-3 text-xs mb-3">
+        <div>
+          <div className="text-[10px] text-tertiary mb-0.5">Daily P/L</div>
+          <div className={dailyPnl != null ? (dailyPnl >= 0 ? "text-success font-bold" : "text-danger font-bold") : "text-tertiary"}>
+            {dailyPnl != null ? `${dailyPnl >= 0 ? "+" : ""}$${dailyPnl.toFixed(2)}` : "—"}
+          </div>
+        </div>
+        <div>
+          <div className="text-[10px] text-tertiary mb-0.5">Unrealized P/L</div>
+          <div className={unrealizedPnl >= 0 ? "text-success font-bold" : "text-danger font-bold"}>
+            {unrealizedPnl >= 0 ? "+" : ""}${unrealizedPnl.toFixed(2)}
+          </div>
+        </div>
+      </div>
+
+      {/* Row 3: Buying Power | Margin Used % */}
+      <div className="grid grid-cols-2 gap-3 text-xs mb-3">
+        <div>
+          <div className="text-[10px] text-tertiary mb-0.5">Buying Power</div>
+          <div className="text-secondary">
+            {buyingPower != null
+              ? `$${buyingPower.toLocaleString("en-US", { maximumFractionDigits: 0 })}`
+              : "—"}
+          </div>
+        </div>
+        <div>
+          <div className="text-[10px] text-tertiary mb-0.5">Margin Used</div>
+          {marginPct != null ? (
+            <>
+              <div className="text-secondary mb-1">{marginPct.toFixed(1)}%</div>
+              <div className="h-1 rounded bg-subtle overflow-hidden">
+                <div
+                  className="h-full rounded bg-accent"
+                  style={{ width: `${Math.min(100, marginPct)}%` }}
+                />
+              </div>
+            </>
+          ) : (
+            <div className="text-tertiary">—</div>
+          )}
+        </div>
+      </div>
+
+      {/* Row 4: Positions | Synced */}
+      <div className="grid grid-cols-2 gap-3 text-xs">
+        <div className="text-tertiary">Positions: <span className="text-secondary">{openPositions}</span></div>
+        <div className="text-tertiary">Synced: --</div>
+      </div>
+    </div>
+  );
+}
 
 function NavDashboard({ accounts, liveNav }: { accounts: Account[]; liveNav: number | null }) {
   const combined = accounts.reduce((acc, a) => ({
     open_positions: acc.open_positions + (a.open_positions || 0),
-    total_credit: acc.total_credit + (a.total_credit || 0),
-    total_margin: acc.total_margin + (a.total_margin || 0),
-    total_pnl: acc.total_pnl + (a.total_pnl || 0),
-  }), { open_positions: 0, total_credit: 0, total_margin: 0, total_pnl: 0 });
+    total_margin:   acc.total_margin   + (a.total_margin   || 0),
+    total_pnl:      acc.total_pnl      + (a.total_pnl      || 0),
+  }), { open_positions: 0, total_margin: 0, total_pnl: 0 });
 
-  const fmt = (n: number | null | undefined, prefix = "$") =>
-    n == null ? <span className="text-zinc-600">—</span> : `${prefix}${Number(n).toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
-
-  const liveNavFormatted =
-    liveNav !== null
-      ? new Intl.NumberFormat("en-US", { style: "currency", currency: "USD" }).format(liveNav)
-      : "$0.00";
+  const paperNav   = accounts.find(a => a.type === "PAPER")?.nav ?? 20000;
+  const combinedNav = (paperNav ?? 0) + (liveNav ?? 0);
 
   return (
-    <div className="rounded-xl border border-zinc-800 overflow-hidden mb-6 shadow-lg">
-      <div className="flex items-center justify-between px-4 py-2.5 bg-zinc-900 border-b border-zinc-800">
-        <span className="text-xs font-mono font-semibold text-zinc-500 tracking-widest">ACCOUNT SUMMARY</span>
+    <div className="rounded-xl border border-subtle overflow-hidden mb-6 shadow-lg">
+      <div className="flex items-center px-4 py-2 bg-card border-b border-subtle">
+        <span className="text-[10px] font-mono font-semibold text-tertiary tracking-widest">ACCOUNT SUMMARY</span>
       </div>
-      <div className="grid divide-x divide-zinc-800" style={{ gridTemplateColumns: `repeat(${accounts.length + 1}, 1fr)` }}>
+      <div
+        className="grid divide-x divide-subtle"
+        style={{ gridTemplateColumns: `repeat(${accounts.length + 1}, 1fr)` }}
+      >
         {accounts.map((a) => (
-          <div key={a.account_id} className={`p-5 ${a.type === 'LIVE' ? 'bg-blue-950/10' : 'bg-zinc-950'}`}>
-            <div className="flex justify-between items-start mb-1">
-              <div className="text-xs font-mono text-zinc-600">{a.type || 'ACCOUNT'}</div>
-              {a.daily_pnl !== undefined && (
-                <div className={`text-[10px] px-1.5 py-0.5 rounded font-mono ${a.daily_pnl >= 0 ? 'bg-[#166534] text-[#22c55e]' : 'bg-[#991b1b] text-[#ef4444]'}`}>
-                  {a.daily_pnl >= 0 ? '+' : ''}${a.daily_pnl.toFixed(2)}
-                </div>
-              )}
-            </div>
-            <div className={`text-xs font-mono mb-3 ${a.type === 'LIVE' ? 'text-blue-400' : 'text-zinc-400'}`}>
-              ···{a.account_id.slice(-4)}
-            </div>
-            <div className="text-2xl font-black font-mono text-zinc-300 mb-1">
-              {a.type === "LIVE" ? liveNavFormatted : fmt(a.nav)}
-            </div>
-            <div className="text-xs text-zinc-600 mb-4 font-mono">NAV</div>
-            <div className="space-y-1.5 text-xs font-mono">
-              <div className="flex justify-between">
-                <span className="text-zinc-600">Open positions</span>
-                <span className="text-zinc-400">{a.open_positions}</span>
-              </div>
-              <div className="flex justify-between">
-                <span className="text-zinc-600">Total credit</span>
-                <span className="text-emerald-400">{fmt(a.total_credit)}</span>
-              </div>
-              <div className="flex justify-between">
-                <span className="text-zinc-600">Margin used</span>
-                <span className="text-zinc-400">{fmt(a.total_margin)}</span>
-              </div>
-              <div className="flex justify-between">
-                <span className="text-zinc-600">Unrealized P/L</span>
-                <span className={a.total_pnl >= 0 ? "text-emerald-400" : "text-red-400"}>
-                  {a.total_pnl >= 0 ? "+" : ""}{fmt(a.total_pnl)}
-                </span>
-              </div>
-            </div>
-          </div>
+          <AccountCard
+            key={a.account_id}
+            label={a.type || "ACCOUNT"}
+            accountId={a.account_id}
+            nav={a.type === "LIVE" ? liveNav : a.nav}
+            dailyPnl={a.daily_pnl}
+            unrealizedPnl={a.total_pnl}
+            buyingPower={a.buying_power}
+            totalMargin={a.total_margin}
+            openPositions={a.open_positions}
+            isLive={a.type === "LIVE"}
+          />
         ))}
-        {/* Combined */}
-        <div className="p-5 bg-zinc-900/50">
-          {(() => {
-            const paperNav = accounts.find(a => a.type === "PAPER")?.nav ?? 20000;
-            const combinedNav = (paperNav ?? 0) + (liveNav ?? 0);
-            return (
-              <>
-                <div className="text-xs font-mono text-zinc-600 mb-1">COMBINED</div>
-                <div className="text-xs font-mono text-zinc-600 mb-3">&nbsp;</div>
-                <div className="text-2xl font-black font-mono text-zinc-300 mb-1">
-                  {combinedNav > 0
-                    ? new Intl.NumberFormat("en-US", { style: "currency", currency: "USD" }).format(combinedNav)
-                    : <span className="text-zinc-600">—</span>}
-                </div>
-                <div className="text-xs text-zinc-600 mb-4 font-mono">NAV</div>
-              </>
-            );
-          })()}
-          <div className="space-y-1.5 text-xs font-mono">
-            <div className="flex justify-between">
-              <span className="text-zinc-600">Open positions</span>
-              <span className="text-zinc-400">{combined.open_positions}</span>
-            </div>
-            <div className="flex justify-between">
-              <span className="text-zinc-600">Total credit</span>
-              <span className="text-emerald-400">{fmt(combined.total_credit)}</span>
-            </div>
-            <div className="flex justify-between">
-              <span className="text-zinc-600">Margin used</span>
-              <span className="text-zinc-400">{fmt(combined.total_margin)}</span>
-            </div>
-            <div className="flex justify-between">
-              <span className="text-zinc-600">Unrealized P/L</span>
-              <span className={combined.total_pnl >= 0 ? "text-emerald-400" : "text-red-400"}>
-                {combined.total_pnl >= 0 ? "+" : ""}{fmt(combined.total_pnl)}
-              </span>
-            </div>
-          </div>
+
+        {/* Combined — purple accent border */}
+        <div className="border-l border-accent/20">
+          <AccountCard
+            label="COMBINED"
+            nav={combinedNav > 0 ? combinedNav : null}
+            dailyPnl={null}
+            unrealizedPnl={combined.total_pnl}
+            buyingPower={null}
+            totalMargin={combined.total_margin}
+            openPositions={combined.open_positions}
+          />
         </div>
       </div>
     </div>
@@ -252,14 +365,14 @@ function ContextPanel({ symbol }: { symbol: string }) {
   if (!events.length) return null;
 
   return (
-    <div className="mx-5 mb-4 px-4 py-3 bg-zinc-900 rounded-lg border border-zinc-800">
-      <div className="text-xs font-mono text-zinc-600 mb-2 tracking-widest">MARKET CONTEXT</div>
+    <div className="mx-5 mb-4 px-4 py-3 bg-card rounded-lg border border-subtle">
+      <div className="text-[10px] font-mono text-tertiary mb-2 tracking-widest">MARKET CONTEXT</div>
       <div className="flex flex-wrap gap-4">
         {events.map((e, i) => {
           const isEarnings = e.event_type?.toLowerCase().includes("earnings");
-          const isFomc = e.event_type?.toLowerCase().includes("fomc");
-          const urgent = e.days_away <= 7;
-          const color = urgent ? "text-red-400" : isEarnings ? "text-amber-400" : "text-zinc-400";
+          const isFomc     = e.event_type?.toLowerCase().includes("fomc");
+          const urgent     = e.days_away <= 7;
+          const color      = urgent ? "text-danger" : isEarnings ? "text-warning" : "text-secondary";
           return (
             <span key={i} className={`flex items-center gap-1.5 text-xs font-mono ${color}`}>
               <span>{isEarnings ? "📅" : isFomc ? "🏛" : "📌"}</span>
@@ -278,8 +391,10 @@ function ScoreBar({ score }: { score: number }) {
   return (
     <div className="flex items-center gap-3">
       <div className="flex-1 h-1.5 bg-zinc-800 rounded-full overflow-hidden">
-        <div className={`h-full rounded-full transition-all duration-700 ${scoreBarColor(score)}`}
-          style={{ width: `${score}%` }} />
+        <div
+          className={`h-full rounded-full transition-all duration-700 ${scoreBarColor(score)}`}
+          style={{ width: `${score}%` }}
+        />
       </div>
       <span className={`text-sm font-mono font-bold tabular-nums w-12 text-right ${scoreColor(score)}`}>
         {score?.toFixed(1)}
@@ -288,49 +403,36 @@ function ScoreBar({ score }: { score: number }) {
   );
 }
 
-// ── Trade Card ────────────────────────────────────────────────────────────────
+// ── Trade Card (Changes 3 + 6) ────────────────────────────────────────────────
 
-function TradeCard({ candidate, onApprove, onReject }: {
+function TradeCard({ candidate, freshnessLevel, onApprove, onReject }: {
   candidate: Candidate;
+  freshnessLevel: FreshnessLevel;
   onApprove: (id: number) => void;
   onReject: (id: number) => void;
 }) {
   const [expanded, setExpanded] = useState(false);
-  const [acting, setActing] = useState(false);
-  
-  // Safely parse JSON strings if necessary
-  const c = typeof candidate.candidate_json === 'string' ? JSON.parse(candidate.candidate_json) : candidate.candidate_json;
-  const card = typeof candidate.llm_card === 'string' ? JSON.parse(candidate.llm_card) : candidate.llm_card;
-  
-  const rec = card?.recommendation ?? "no";
+  const [acting, setActing]     = useState(false);
+
+  const c    = typeof candidate.candidate_json === "string" ? JSON.parse(candidate.candidate_json) : candidate.candidate_json;
+  const card = typeof candidate.llm_card        === "string" ? JSON.parse(candidate.llm_card)        : candidate.llm_card;
+
+  const rec    = card?.recommendation ?? "no";
   const ivRank = c?.iv_rank;
 
-  // Keyboard Shortcuts for individual cards (only when visible/first in list)
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
-      if (candidate.is_stale || acting) return; 
-      if (e.key.toLowerCase() === 'a') {
-        setActing(true);
-        onApprove(candidate.id);
-      }
-      if (e.key.toLowerCase() === 'r') {
-        setActing(true);
-        onReject(candidate.id);
-      }
+      if (candidate.is_stale || acting) return;
+      if (e.key.toLowerCase() === "a") { setActing(true); onApprove(candidate.id); }
+      if (e.key.toLowerCase() === "r") { setActing(true); onReject(candidate.id);  }
     };
-    window.addEventListener('keydown', handleKeyDown);
-    return () => window.removeEventListener('keydown', handleKeyDown);
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
   }, [candidate.id, candidate.is_stale, acting, onApprove, onReject]);
 
   return (
-    <div className={`border rounded-xl overflow-hidden shadow-lg ${recBorderBg(rec)}`}>
-
-      {candidate.is_stale && (
-        <div className="flex items-center gap-2 px-4 py-2 bg-amber-500/10 border-b border-amber-500/20 text-amber-400 text-xs font-mono">
-          <AlertTriangle size={11} />
-          DATA IS {candidate.age_minutes.toFixed(0)} MIN OLD — MARKET MAY HAVE MOVED. REFRESH BEFORE APPROVING.
-        </div>
-      )}
+    // Change 6: card-shadow keeps recommendation bg/border, adds depth + rounded corners
+    <div className={`card-shadow border rounded-xl overflow-hidden ${recBorderBg(rec)}`}>
 
       {/* Header */}
       <div className="flex items-start justify-between p-5 border-b border-zinc-800/60">
@@ -345,6 +447,17 @@ function TradeCard({ candidate, onApprove, onReject }: {
               <span className="flex items-center gap-1.5 px-2.5 py-1 bg-purple-500/10 border border-purple-500/20 rounded text-xs font-mono">
                 <span className="text-zinc-500">IV RANK</span>
                 <span className="text-purple-400 font-bold">{ivRank.toFixed(0)}</span>
+              </span>
+            )}
+            {/* Correction 2: severity-only freshness pill — no raw age number */}
+            {freshnessLevel === "delayed" && (
+              <span className="text-[10px] font-mono px-2 py-0.5 rounded-full flex items-center gap-1 text-warning bg-warning/10 border border-warning/20">
+                <Clock size={8} /> Delayed
+              </span>
+            )}
+            {freshnessLevel === "stale" && (
+              <span className="text-[10px] font-mono px-2 py-0.5 rounded-full flex items-center gap-1 text-danger bg-negative/10 border border-negative/20">
+                <Clock size={8} /> Stale
               </span>
             )}
           </div>
@@ -369,10 +482,10 @@ function TradeCard({ candidate, onApprove, onReject }: {
       {c && (
         <div className="grid grid-cols-4 gap-px bg-zinc-800/40 mx-5 my-4 rounded-lg overflow-hidden">
           {[
-            { label: "LONG PUT", val: c.long_put_strike, delta: null },
-            { label: "SHORT PUT", val: c.short_put_strike, delta: c.short_put_delta },
+            { label: "LONG PUT",   val: c.long_put_strike,   delta: null },
+            { label: "SHORT PUT",  val: c.short_put_strike,  delta: c.short_put_delta },
             { label: "SHORT CALL", val: c.short_call_strike, delta: c.short_call_delta },
-            { label: "LONG CALL", val: c.long_call_strike, delta: null },
+            { label: "LONG CALL",  val: c.long_call_strike,  delta: null },
           ].map(({ label, val, delta }) => (
             <div key={label} className="bg-zinc-900 px-3 py-3 text-center">
               <div className="text-[10px] font-mono text-zinc-600 mb-1.5">{label}</div>
@@ -468,9 +581,9 @@ function TradeCard({ candidate, onApprove, onReject }: {
               <ul className="space-y-1">
                 {card.conditions_if_conditional
                   .filter((s: string) => s && !s.toLowerCase().includes("only populate"))
-                  .map((c: string, i: number) => (
+                  .map((cond: string, i: number) => (
                     <li key={i} className="flex gap-2 text-amber-300 leading-relaxed">
-                      <span className="shrink-0 mt-0.5">›</span>{c}
+                      <span className="shrink-0 mt-0.5">›</span>{cond}
                     </li>
                   ))}
               </ul>
@@ -503,7 +616,7 @@ function TradeCard({ candidate, onApprove, onReject }: {
           disabled={acting || candidate.is_stale}
           className="flex items-center justify-center gap-2 py-3 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white font-mono font-bold text-sm transition-all disabled:opacity-50 disabled:bg-zinc-800"
         >
-          <CheckCircle size={15} /> {candidate.is_stale ? 'STALE DATA' : 'APPROVE (A)'}
+          <CheckCircle size={15} /> {candidate.is_stale ? "STALE DATA" : "APPROVE (A)"}
         </button>
         <button
           onClick={() => { setActing(true); onReject(candidate.id); }}
@@ -517,76 +630,100 @@ function TradeCard({ candidate, onApprove, onReject }: {
   );
 }
 
-// ── Positions Panel ───────────────────────────────────────────────────────────
+// ── Position Row (Changes 5 + 6) ──────────────────────────────────────────────
 
 function PositionRow({ p }: { p: Position }) {
   const [open, setOpen] = useState(false);
-  const credit = p.fill_credit ?? p.entry_credit;
-  const pnl = p.unrealized_pnl ?? 0;
-  const pct = p.profit_pct;
-  const target50  = credit != null ? credit * 0.5 : null;
-  const stop200   = credit != null ? credit * 2.0 : null;
+  const credit  = p.fill_credit ?? p.entry_credit;
+  const pnl     = p.unrealized_pnl ?? 0;
+  const pct     = p.profit_pct;
+  const target50 = credit != null ? credit * 0.5 : null;
+  const stop200  = credit != null ? credit * 2.0 : null;
+
   const dte = typeof p.dte === "number" && !Number.isNaN(p.dte)
     ? p.dte
     : (p.expiry ? Math.ceil((new Date(p.expiry).getTime() - Date.now()) / 86400000) : NaN);
-  const dteDisplay = Number.isNaN(dte) || dte === undefined ? "--d" : `${dte}d`;
+  const dteDisplay   = Number.isNaN(dte) || dte === undefined ? "--d" : `${dte}d`;
   const accountBadge = p.account_id === "PAPER" ? "PAPER" : `···${p.account_id?.slice(-4) ?? ""}`;
+  const mark         = p.mark;
+
+  // Correction 4: new chip logic
+  const chipKey = getChip(mark, credit, Number.isNaN(dte) ? null : dte);
 
   return (
-    <div className="rounded-xl border border-zinc-800 overflow-hidden mb-3 bg-zinc-900/50 shadow-sm">
+    // Change 6: card-surface (bg + border + shadow + gradient)
+    <div className="card-surface mb-3 overflow-hidden">
       <button
         onClick={() => setOpen(o => !o)}
-        className="w-full flex items-center justify-between px-5 py-4 hover:bg-zinc-800/60 transition-colors"
+        className="w-full flex items-center gap-3 px-5 py-3.5 hover:bg-white/[0.02] transition-colors text-left"
       >
-        <div className="flex items-center gap-4">
-          {open ? <ChevronUp size={14} className="text-zinc-600" /> : <ChevronDown size={14} className="text-zinc-600" />}
-          <span className="text-white font-bold text-base font-mono">{p.symbol}</span>
-          <span className="text-zinc-500 text-sm font-mono">{p.expiry} · {dteDisplay}</span>
-          <span className="text-zinc-600 text-xs font-mono">{accountBadge}</span>
+        {open ? <ChevronUp size={13} className="text-tertiary shrink-0" /> : <ChevronDown size={13} className="text-tertiary shrink-0" />}
+
+        {/* Left group — symbol + IC tag + DTE + qty + credit */}
+        <div className="flex items-center gap-3 flex-1 min-w-0 font-mono">
+          <span className="text-primary font-bold text-base">{p.symbol}</span>
+          <span className="text-[10px] px-1.5 py-0.5 rounded bg-white/5 text-tertiary border border-subtle">IC</span>
+          <span className="text-secondary text-xs">{p.expiry} · {dteDisplay}</span>
+          {p.qty != null && (
+            <span className="text-tertiary text-xs">{p.qty}×</span>
+          )}
+          <span className="text-secondary text-xs">{credit != null ? `$${credit.toFixed(2)} cr` : "—"}</span>
+          <span className="text-secondary text-xs">
+            Mark: {mark != null ? `$${mark.toFixed(2)}` : "—"}
+          </span>
         </div>
-        <div className="flex items-center gap-6 font-mono text-sm">
-          <span className="text-zinc-400">{credit != null ? `$${credit.toFixed(2)}` : "$—"} cr</span>
-          <span className={pnl >= 0 ? "text-emerald-400 font-bold" : "text-red-400 font-bold"}>
-            {pnl >= 0 ? "+" : ""}${pnl.toFixed(0)}
-            {pct != null && <span className="text-xs ml-1 opacity-70">{pct >= 0 ? "+" : ""}{pct.toFixed(0)}%</span>}
+
+        {/* Right group — P/L + account + status chip */}
+        <div className="flex items-center gap-3 font-mono text-xs shrink-0">
+          <span className={pnl !== 0 ? (pnl >= 0 ? "text-success font-bold" : "text-danger font-bold") : "text-secondary"}>
+            {mark != null
+              ? `${pnl >= 0 ? "+" : ""}$${pnl.toFixed(0)}`
+              : "—"}
+            {mark != null && pct != null && (
+              <span className="opacity-60 ml-1 text-[10px]">{pct >= 0 ? "+" : ""}{pct.toFixed(0)}%</span>
+            )}
+          </span>
+          <span className="text-tertiary text-[10px]">{accountBadge}</span>
+          <span className={`text-[10px] px-1.5 py-0.5 rounded font-mono font-bold ${chipStyle[chipKey]}`}>
+            {chipKey}
           </span>
         </div>
       </button>
 
       {open && (
-        <div className="border-t border-zinc-800 bg-zinc-950">
-          <div className="grid grid-cols-2 divide-x divide-zinc-800">
+        <div className="border-t border-subtle bg-zinc-950">
+          <div className="grid grid-cols-2 divide-x divide-subtle">
             {/* Entry details */}
             <div className="p-4">
-              <div className="text-[10px] font-mono text-zinc-600 tracking-widest mb-3">ENTRY DETAILS</div>
+              <div className="text-[10px] font-mono text-tertiary tracking-widest mb-3">ENTRY DETAILS</div>
               <div className="space-y-2 text-sm font-mono">
-                {[
-                  ["Credit received", credit != null ? `$${credit.toFixed(2)}` : "—"],
-                  ["Contracts", p.qty != null ? String(p.qty) : "—"],
+                {([
+                  ["Credit received",    credit != null ? `$${credit.toFixed(2)}` : "—"],
+                  ["Contracts",          p.qty != null ? String(p.qty) : "—"],
                   ["Total credit gained", credit != null && p.qty != null ? `$${(credit * p.qty * 100).toFixed(2)}` : "—"],
-                  ["Max risk (margin)", p.max_risk != null ? `$${p.max_risk?.toFixed(2)}` : "—"],
-                  ["Net delta", p.net_delta?.toFixed(4) ?? "—"],
-                  ["Account", accountBadge],
-                ].map(([l, v]) => (
+                  ["Max risk (margin)",  p.max_risk != null ? `$${p.max_risk?.toFixed(2)}` : "—"],
+                  ["Net delta",          p.net_delta?.toFixed(4) ?? "—"],
+                  ["Account",            accountBadge],
+                ] as [string, string][]).map(([l, v]) => (
                   <div key={l} className="flex justify-between">
-                    <span className="text-zinc-600">{l}</span>
-                    <span className="text-zinc-300">{v}</span>
+                    <span className="text-tertiary">{l}</span>
+                    <span className="text-secondary">{v}</span>
                   </div>
                 ))}
               </div>
             </div>
             {/* P&L */}
             <div className="p-4">
-              <div className="text-[10px] font-mono text-zinc-600 tracking-widest mb-3">UNREALIZED P/L</div>
+              <div className="text-[10px] font-mono text-tertiary tracking-widest mb-3">UNREALIZED P/L</div>
               <div className="space-y-2 text-sm font-mono">
-                {[
-                  ["Gross P/L", { val: `${pnl >= 0 ? "+" : ""}$${pnl.toFixed(2)}`, color: pnl >= 0 ? "text-emerald-400" : "text-red-400" }],
-                  ["% of credit", { val: pct != null ? `${pct >= 0 ? "+" : ""}${pct.toFixed(1)}%` : "—", color: (pct ?? 0) >= 0 ? "text-emerald-400" : "text-red-400" }],
-                  ["50% target", { val: target50 != null ? `$${target50.toFixed(2)}` : "—", color: "text-zinc-300" }],
-                  ["200% stop", { val: stop200 != null ? `$${stop200.toFixed(2)}` : "—", color: "text-red-400" }],
-                ].map(([l, v]: any) => (
+                {([
+                  ["Gross P/L",   { val: `${pnl >= 0 ? "+" : ""}$${pnl.toFixed(2)}`,                           color: pnl >= 0 ? "text-success" : "text-danger" }],
+                  ["% of credit", { val: pct != null ? `${pct >= 0 ? "+" : ""}${pct.toFixed(1)}%` : "—",       color: (pct ?? 0) >= 0 ? "text-success" : "text-danger" }],
+                  ["50% target",  { val: target50 != null ? `$${target50.toFixed(2)}` : "—",                    color: "text-secondary" }],
+                  ["200% stop",   { val: stop200  != null ? `$${stop200.toFixed(2)}`  : "—",                    color: "text-danger" }],
+                ] as [string, { val: string; color: string }][]).map(([l, v]) => (
                   <div key={l} className="flex justify-between">
-                    <span className="text-zinc-600">{l}</span>
+                    <span className="text-tertiary">{l}</span>
                     <span className={v.color}>{v.val}</span>
                   </div>
                 ))}
@@ -595,9 +732,9 @@ function PositionRow({ p }: { p: Position }) {
           </div>
           {/* Legs */}
           {p.legs && Object.keys(p.legs).length > 0 && (
-            <div className="px-4 pb-3 border-t border-zinc-800">
-              <div className="text-[10px] font-mono text-zinc-600 tracking-widest mt-3 mb-2">LEGS</div>
-              <div className="text-xs font-mono text-zinc-500 bg-zinc-900 rounded p-2 overflow-x-auto">
+            <div className="px-4 pb-3 border-t border-subtle">
+              <div className="text-[10px] font-mono text-tertiary tracking-widest mt-3 mb-2">LEGS</div>
+              <div className="text-xs font-mono text-secondary bg-card rounded p-2 overflow-x-auto">
                 {JSON.stringify(p.legs, null, 2)}
               </div>
             </div>
@@ -614,15 +751,13 @@ function ExitSignalRow({ s, onAction }: {
   s: ExitSignal;
   onAction: (id: number, action: "acknowledge" | "snooze" | "dismiss") => void;
 }) {
-  const [open, setOpen] = useState(false);
+  const [open, setOpen]     = useState(false);
   const [acting, setActing] = useState(false);
 
-  const reasonColor = s.reason === "profit_target" ? "text-emerald-400"
-    : s.reason === "stop_loss" ? "text-red-400" : "text-amber-400";
-
-  const profitPct = s.pnl_pct ?? 0;
+  const reasonColor   = s.reason === "profit_target" ? "text-success" : s.reason === "stop_loss" ? "text-danger" : "text-warning";
+  const profitPct     = s.pnl_pct ?? 0;
   const creditReceived = s.credit_received ?? 0;
-  const debitToClose = s.debit_to_close ?? 0;
+  const debitToClose  = s.debit_to_close ?? 0;
 
   return (
     <div className={`rounded-xl border overflow-hidden mb-3 ${
@@ -636,60 +771,60 @@ function ExitSignalRow({ s, onAction }: {
           {open ? <ChevronUp size={14} className="text-zinc-600" /> : <ChevronDown size={14} className="text-zinc-600" />}
           <span className="text-white font-bold text-base font-mono">{s.symbol}</span>
           <span className="text-zinc-500 text-sm font-mono">{s.expiry} · {s.dte}d</span>
-          <span className={`text-xs font-mono font-bold px-2 py-0.5 rounded-sm bg-zinc-950 border border-zinc-800 ${reasonColor}`}>
+          <span className={`text-xs font-mono font-bold px-2 py-0.5 rounded-sm bg-zinc-950 border border-subtle ${reasonColor}`}>
             {s.reason?.toUpperCase()}
           </span>
         </div>
         <div className="flex items-center gap-4 font-mono text-sm">
-          <span className={profitPct >= 0 ? "text-emerald-400 font-bold" : "text-red-400 font-bold"}>
+          <span className={profitPct >= 0 ? "text-success font-bold" : "text-danger font-bold"}>
             {profitPct >= 0 ? "+" : ""}{profitPct.toFixed(1)}%
           </span>
-          <span className={s.pnl_dollars >= 0 ? "text-emerald-400" : "text-red-400"}>
+          <span className={s.pnl_dollars >= 0 ? "text-success" : "text-danger"}>
             ${s.pnl_dollars?.toFixed(0)}
           </span>
         </div>
       </button>
 
       {open && (
-        <div className="border-t border-zinc-800 bg-zinc-950">
-          <div className="grid grid-cols-2 divide-x divide-zinc-800">
+        <div className="border-t border-subtle bg-zinc-950">
+          <div className="grid grid-cols-2 divide-x divide-subtle">
             <div className="p-4">
-              <div className="text-[10px] font-mono text-zinc-600 tracking-widest mb-3">SIGNAL DETAILS</div>
+              <div className="text-[10px] font-mono text-tertiary tracking-widest mb-3">SIGNAL DETAILS</div>
               <div className="space-y-2 text-sm font-mono">
-                {[
-                  ["Signal type", s.reason?.toUpperCase()],
-                  ["Signal age", `${s.age_minutes.toFixed(0)}m ago`],
+                {([
+                  ["Signal type",    s.reason?.toUpperCase()],
+                  ["Signal age",     `${s.age_minutes.toFixed(0)}m ago`],
                   ["Triggered at DTE", s.dte],
-                ].map(([l, v]: any) => (
+                ] as [string, any][]).map(([l, v]) => (
                   <div key={l} className="flex justify-between">
-                    <span className="text-zinc-600">{l}</span>
-                    <span className="text-zinc-300">{v}</span>
+                    <span className="text-tertiary">{l}</span>
+                    <span className="text-secondary">{v}</span>
                   </div>
                 ))}
               </div>
             </div>
             <div className="p-4">
-              <div className="text-[10px] font-mono text-zinc-600 tracking-widest mb-3">CLOSING ESTIMATE</div>
+              <div className="text-[10px] font-mono text-tertiary tracking-widest mb-3">CLOSING ESTIMATE</div>
               <div className="space-y-2 text-sm font-mono">
-                {[
+                {([
                   ["Credit received", creditReceived > 0 ? `$${creditReceived.toFixed(2)}` : "—"],
-                  ["Debit to close", debitToClose > 0 ? `$${debitToClose.toFixed(2)}` : "—"],
-                  ["Est. P/L", { val: `${s.pnl_dollars >= 0 ? "+" : ""}$${s.pnl_dollars?.toFixed(2)}`, color: s.pnl_dollars >= 0 ? "text-emerald-400" : "text-red-400" }],
-                  ["% of credit", { val: `${profitPct >= 0 ? "+" : ""}${profitPct.toFixed(1)}%`, color: profitPct >= 0 ? "text-emerald-400" : "text-red-400" }],
-                ].map(([l, v]: any) => (
+                  ["Debit to close",  debitToClose  > 0 ? `$${debitToClose.toFixed(2)}`  : "—"],
+                  ["Est. P/L",   { val: `${s.pnl_dollars >= 0 ? "+" : ""}$${s.pnl_dollars?.toFixed(2)}`, color: s.pnl_dollars >= 0 ? "text-success" : "text-danger" }],
+                  ["% of credit", { val: `${profitPct >= 0 ? "+" : ""}${profitPct.toFixed(1)}%`,          color: profitPct >= 0 ? "text-success" : "text-danger" }],
+                ] as [string, any][]).map(([l, v]) => (
                   <div key={l} className="flex justify-between">
-                    <span className="text-zinc-600">{l}</span>
+                    <span className="text-tertiary">{l}</span>
                     {typeof v === "object"
                       ? <span className={v.color}>{v.val}</span>
-                      : <span className="text-zinc-300">{v}</span>}
+                      : <span className="text-secondary">{v}</span>}
                   </div>
                 ))}
               </div>
             </div>
           </div>
-          <div className="px-4 py-3 bg-zinc-900/80 border-t border-zinc-800">
-            <div className="text-[10px] font-mono text-zinc-600 tracking-widest mb-2">RECOMMENDED ACTION</div>
-            <p className="text-zinc-400 text-sm font-mono italic">
+          <div className="px-4 py-3 bg-zinc-900/80 border-t border-subtle">
+            <div className="text-[10px] font-mono text-tertiary tracking-widest mb-2">RECOMMENDED ACTION</div>
+            <p className="text-secondary text-sm font-mono italic">
               {s.reason === "profit_target"
                 ? `Position has captured ${profitPct.toFixed(0)}% of max profit. Close now to lock in gains and free up capital.`
                 : s.reason === "time_exit"
@@ -697,7 +832,7 @@ function ExitSignalRow({ s, onAction }: {
                   : `Stop loss triggered. Close immediately to prevent further loss.`}
             </p>
           </div>
-          <div className="grid grid-cols-3 gap-3 p-4 border-t border-zinc-800">
+          <div className="grid grid-cols-3 gap-3 p-4 border-t border-subtle">
             <button
               onClick={() => { setActing(true); onAction(s.id, "acknowledge"); }}
               disabled={acting}
@@ -739,6 +874,23 @@ export default function Dashboard() {
   const [polling, setPolling]       = useState(false);
   const [tab, setTab]               = useState<"candidates" | "positions" | "exits">("candidates");
 
+  // Correction 1: data age derived from freshest candidate created_at
+  const dataAgeSeconds = useMemo(() => {
+    if (candidates.length > 0) {
+      const freshestMs = Math.max(...candidates.map(c => new Date(c.created_at).getTime()));
+      return Math.floor((Date.now() - freshestMs) / 1000);
+    }
+    if (health?.data_freshness?.last_snapshot_minutes_ago != null) {
+      return health.data_freshness.last_snapshot_minutes_ago * 60;
+    }
+    return null;
+  }, [candidates, health]);
+
+  const systemLevel: FreshnessLevel = useMemo(() => {
+    if (dataAgeSeconds === null) return "unknown";
+    return getFreshnessLevel(dataAgeSeconds / 60);
+  }, [dataAgeSeconds]);
+
   const fetchAll = useCallback(async () => {
     setPolling(true);
     try {
@@ -774,7 +926,7 @@ export default function Dashboard() {
     try {
       await axios.post(`${API}/candidates/${id}/approve`, { idempotency_key: Date.now().toString() });
       fetchAll();
-    } catch (err) {
+    } catch {
       alert("Execution failed. Check backend logs.");
     }
   };
@@ -798,37 +950,26 @@ export default function Dashboard() {
   };
 
   return (
-    <div className="min-h-screen bg-[#0d0d0d] text-white">
-      {/* Header */}
-      <header className="border-b border-zinc-800 sticky top-0 z-10 bg-[#0d0d0d]/95 backdrop-blur">
-        <div className="flex items-center justify-between px-6 py-4">
-          <div className="flex items-center gap-3">
-            <Activity className="text-emerald-500" size={20} />
-            <span className="font-mono font-black tracking-widest text-lg text-white">SPARK COMMAND CENTER</span>
-            <span className="text-zinc-600 font-mono text-xs hidden sm:inline">/ Iron Condor Desk</span>
-          </div>
-          <div className="flex items-center gap-4">
-            <span className="text-xs font-mono text-zinc-600">
-              {lastPoll ? lastPoll.toLocaleTimeString() : "—"}
-            </span>
-            <button
-              onClick={fetchAll}
-              className="flex items-center gap-1.5 text-xs font-mono text-zinc-500 hover:text-zinc-300 transition-colors"
-            >
-              <RefreshCw size={12} className={polling ? "animate-spin" : ""} />
-              REFRESH
-            </button>
-          </div>
-        </div>
-        <StatusBar health={health} />
+    <div className="min-h-screen bg-page text-primary">
+
+      {/* Change 2: Operator Bar — single sticky header strip */}
+      <header className="sticky top-0 z-10 bg-card/95 backdrop-blur">
+        <OperatorBar
+          dataAgeSeconds={dataAgeSeconds}
+          systemLevel={systemLevel}
+          openCount={positions.length}
+          pendingCount={candidates.length}
+          polling={polling}
+          onRefresh={fetchAll}
+        />
       </header>
 
-      {/* Circuit breaker banner */}
+      {/* Circuit breaker alert banner */}
       {health?.circuit_breaker?.state === "open" && (
-        <div className="flex items-center gap-3 px-6 py-3 bg-red-900/30 border-b border-red-900/50 text-red-400 font-mono text-sm">
+        <div className="flex items-center gap-3 px-6 py-3 bg-red-900/30 border-b border-red-900/50 text-danger font-mono text-sm">
           <AlertTriangle size={15} />
           <span className="font-bold">CIRCUIT BREAKER OPEN</span>
-          <span className="text-red-500/60">— LLM layer disabled. Check backend logs.</span>
+          <span className="opacity-60">— LLM layer disabled. Check backend logs.</span>
         </div>
       )}
 
@@ -837,39 +978,54 @@ export default function Dashboard() {
         {/* NAV Dashboard */}
         {accounts.length > 0 && <NavDashboard accounts={accounts} liveNav={liveNav} />}
 
-        {/* Tabs */}
-        <div className="flex gap-2 mb-6 border-b border-zinc-800 pb-px">
+        {/* Change 7: Tab bar — 13px font, accent active border, badge counts, tab-btn hover */}
+        <div className="flex gap-1 mb-6 border-b border-subtle pb-px">
           {([
-            ["candidates", `Pending (${candidates.length})`],
-            ["positions", `Positions (${positions.length})`],
-            ["exits", `Exit Signals (${signals.length})`],
-          ] as const).map(([key, label]) => (
-            <button
-              key={key}
-              onClick={() => setTab(key)}
-              className={`px-6 py-3 text-sm font-mono font-medium transition-all border-b-2 ${
-                tab === key
-                  ? "text-emerald-400 border-emerald-400 bg-emerald-500/5"
-                  : "text-zinc-500 border-transparent hover:text-zinc-300 hover:border-zinc-700"
-              }${key === "exits" && signals.length > 0 && tab !== "exits" ? " !text-amber-400" : ""}`}
-            >
-              {label}
-            </button>
-          ))}
+            ["candidates", "Pending",      candidates.length],
+            ["positions",  "Positions",    positions.length],
+            ["exits",      "Exit Signals", signals.length],
+          ] as const).map(([key, label, count]) => {
+            const isActive   = tab === key;
+            const hasUrgent  = key === "exits" && signals.length > 0 && !isActive;
+            return (
+              <button
+                key={key}
+                onClick={() => setTab(key)}
+                className={`tab-btn px-5 py-2.5 text-[13px] font-mono font-medium transition-all border-b-2 flex items-center gap-2 ${
+                  isActive
+                    ? "text-accent border-accent bg-accent/5"
+                    : hasUrgent
+                      ? "text-warning border-transparent"
+                      : "text-secondary border-transparent"
+                }`}
+              >
+                {label}
+                {count > 0 && (
+                  <span className={`text-[10px] px-1.5 py-0.5 rounded-full font-mono ${
+                    isActive      ? "bg-accent/20 text-accent"
+                    : hasUrgent  ? "bg-warning/15 text-warning"
+                    : "bg-white/5 text-tertiary"
+                  }`}>
+                    {count}
+                  </span>
+                )}
+              </button>
+            );
+          })}
         </div>
 
         {/* Content */}
         {tab === "candidates" && (
           candidates.length === 0 ? (
-            <div className="text-center py-20 border border-dashed border-zinc-800 rounded-xl bg-zinc-900/30">
-              <TrendingUp size={32} className="mx-auto mb-3 text-zinc-700" />
-              <div className="text-zinc-400 text-lg">No pending trade candidates</div>
-              <div className="text-xs mt-2 text-zinc-600 font-mono">Polling every 5s · Awaiting strategy engine output</div>
+            <div className="text-center py-20 border border-dashed border-subtle rounded-xl bg-card/30">
+              <TrendingUp size={32} className="mx-auto mb-3 text-tertiary" />
+              <div className="text-secondary text-lg">No pending trade candidates</div>
+              <div className="text-xs mt-2 text-tertiary font-mono">Polling every 5s · Awaiting strategy engine output</div>
             </div>
           ) : (
             <div className="grid grid-cols-1 xl:grid-cols-2 gap-6">
               {candidates.map(c => (
-                <TradeCard key={c.id} candidate={c} onApprove={handleApprove} onReject={handleReject} />
+                <TradeCard key={c.id} candidate={c} freshnessLevel={systemLevel} onApprove={handleApprove} onReject={handleReject} />
               ))}
             </div>
           )
@@ -877,17 +1033,17 @@ export default function Dashboard() {
 
         {tab === "positions" && (
           positions.length === 0 ? (
-            <div className="text-center py-20 border border-dashed border-zinc-800 rounded-xl bg-zinc-900/30 font-mono text-sm text-zinc-500">
+            <div className="text-center py-20 border border-dashed border-subtle rounded-xl bg-card/30 font-mono text-sm text-secondary">
               No open positions found in database.
             </div>
           ) : (
-            <div className="space-y-4 max-w-4xl">{positions.map(p => <PositionRow key={p.id} p={p} />)}</div>
+            <div className="space-y-0 max-w-4xl">{positions.map(p => <PositionRow key={p.id} p={p} />)}</div>
           )
         )}
 
         {tab === "exits" && (
           signals.length === 0 ? (
-            <div className="text-center py-20 border border-dashed border-zinc-800 rounded-xl bg-zinc-900/30 font-mono text-sm text-zinc-500">
+            <div className="text-center py-20 border border-dashed border-subtle rounded-xl bg-card/30 font-mono text-sm text-secondary">
               No pending exit signals triggered.
             </div>
           ) : (
