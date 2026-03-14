@@ -59,10 +59,10 @@ interface ExitSignal {
 
 interface Account {
   account_id: string; open_positions: number;
-  total_credit: number; total_margin: number; total_pnl: number;
+  total_credit: number | null; total_margin: number | null; total_pnl: number | null;
   nav: number | null; buying_power: number | null;
   type?: string;
-  daily_pnl?: number;
+  daily_pnl?: number | null;
 }
 
 interface Event {
@@ -219,16 +219,16 @@ function AccountCard({ label, accountId, nav, dailyPnl, unrealizedPnl, buyingPow
   accountId?: string;
   nav: number | null;
   dailyPnl?: number | null;
-  unrealizedPnl: number;
+  unrealizedPnl: number | null;
   buyingPower?: number | null;
-  totalMargin: number;
+  totalMargin: number | null;
   openPositions: number;
   isLive?: boolean;
 }) {
   const navStr = nav != null
     ? new Intl.NumberFormat("en-US", { style: "currency", currency: "USD" }).format(nav)
     : "—";
-  const marginPct = nav != null && nav > 0 ? (totalMargin / nav) * 100 : null;
+  const marginPct = nav != null && nav > 0 && totalMargin != null ? (totalMargin / nav) * 100 : null;
 
   return (
     <div className={`p-5 card-surface rounded-none border-0 font-mono ${isLive ? "bg-blue-950/10" : ""}`}>
@@ -258,8 +258,8 @@ function AccountCard({ label, accountId, nav, dailyPnl, unrealizedPnl, buyingPow
         </div>
         <div>
           <div className="text-[10px] text-tertiary mb-0.5">Unrealized P/L</div>
-          <div className={unrealizedPnl >= 0 ? "text-success font-bold" : "text-danger font-bold"}>
-            {unrealizedPnl >= 0 ? "+" : ""}${unrealizedPnl.toFixed(2)}
+          <div className={unrealizedPnl == null ? "text-tertiary" : unrealizedPnl >= 0 ? "text-success font-bold" : "text-danger font-bold"}>
+            {unrealizedPnl == null ? "—" : `${unrealizedPnl >= 0 ? "+" : ""}$${Math.abs(unrealizedPnl).toFixed(2)}`}
           </div>
         </div>
       </div>
@@ -303,9 +303,9 @@ function AccountCard({ label, accountId, nav, dailyPnl, unrealizedPnl, buyingPow
 
 function NavDashboard({ accounts, liveNav }: { accounts: Account[]; liveNav: number | null }) {
   const combined = accounts.reduce((acc, a) => ({
-    open_positions: acc.open_positions + (a.open_positions || 0),
-    total_margin:   acc.total_margin   + (a.total_margin   || 0),
-    total_pnl:      acc.total_pnl      + (a.total_pnl      || 0),
+    open_positions: acc.open_positions + (a.open_positions ?? 0),
+    total_margin:   acc.total_margin   + (a.total_margin   ?? 0),
+    total_pnl:      acc.total_pnl      + (a.total_pnl      ?? 0),
   }), { open_positions: 0, total_margin: 0, total_pnl: 0 });
 
   const paperNav   = accounts.find(a => a.type === "PAPER")?.nav ?? 20000;
