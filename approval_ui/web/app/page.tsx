@@ -110,15 +110,15 @@ function formatExpiry(isoDate: string): string {
   return `${month} ${parseInt(parts[2], 10)}`;
 }
 
-// Extract first sentence — skips decimal points (e.g. "1.06"), capped at maxLen
+// Extract first sentence — skips decimal points (e.g. "1.06"), capped at maxLen.
+// Uses a character-walk instead of lookbehind regex for Safari/WebKit compatibility.
 function firstSentence(text: string | undefined, maxLen = 140): string {
   if (!text) return "";
-  // Find the first period that is NOT between two digits (skips "1.06", "0.50", etc.)
-  const sentenceEnd = text.search(/(?<!\d)\.(?!\d)/);
-  if (sentenceEnd > 0 && sentenceEnd <= maxLen) return text.slice(0, sentenceEnd + 1);
-  // Fallback: any period after position 10 (avoids "Mr." etc. at start)
-  const laterPeriod = text.indexOf(".", 10);
-  if (laterPeriod > 0 && laterPeriod <= maxLen) return text.slice(0, laterPeriod + 1);
+  for (let i = 1; i < Math.min(text.length, maxLen); i++) {
+    if (text[i] === "." && (i + 1 >= text.length || text[i + 1] === " ") && !/\d/.test(text[i - 1])) {
+      return text.slice(0, i + 1);
+    }
+  }
   if (text.length <= maxLen) return text;
   const lastSpace = text.slice(0, maxLen).lastIndexOf(" ");
   return (lastSpace > 0 ? text.slice(0, lastSpace) : text.slice(0, maxLen)) + "…";
