@@ -69,10 +69,12 @@ interface Event {
   symbol: string; event_type: string; event_ts: string; days_away: number;
 }
 
+interface TokenData { valid: boolean; days_remaining: number }
 interface Health {
   circuit_breaker: { state: string; failures: number; attempts: number };
   data_freshness: { last_snapshot_minutes_ago: number | null; is_stale: boolean };
-  token?: { valid: boolean; days_remaining: number };
+  // Backend returns object when expiry is known; string sentinel ("present"|"missing"|"error:…") otherwise
+  token?: TokenData | string | null;
 }
 
 // ── Freshness helpers ─────────────────────────────────────────────────────────
@@ -99,6 +101,29 @@ function formatDataAge(seconds: number | null): string {
   return `${Math.floor(seconds / 3600)}h ago`;
 }
 
+// "2026-03-20" → "Mar 20"
+function formatExpiry(isoDate: string): string {
+  const parts = isoDate.split("-");
+  if (parts.length < 3) return isoDate;
+  const months = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
+  const month = months[parseInt(parts[1], 10) - 1] ?? parts[1];
+  return `${month} ${parseInt(parts[2], 10)}`;
+}
+
+// Extract first sentence — skips decimal points (e.g. "1.06"), capped at maxLen
+function firstSentence(text: string | undefined, maxLen = 140): string {
+  if (!text) return "";
+  // Find the first period that is NOT between two digits (skips "1.06", "0.50", etc.)
+  const sentenceEnd = text.search(/(?<!\d)\.(?!\d)/);
+  if (sentenceEnd > 0 && sentenceEnd <= maxLen) return text.slice(0, sentenceEnd + 1);
+  // Fallback: any period after position 10 (avoids "Mr." etc. at start)
+  const laterPeriod = text.indexOf(".", 10);
+  if (laterPeriod > 0 && laterPeriod <= maxLen) return text.slice(0, laterPeriod + 1);
+  if (text.length <= maxLen) return text;
+  const lastSpace = text.slice(0, maxLen).lastIndexOf(" ");
+  return (lastSpace > 0 ? text.slice(0, lastSpace) : text.slice(0, maxLen)) + "…";
+}
+
 // ── Position status chip (Correction 4) ──────────────────────────────────────
 
 type StatusChip = "TARGET" | "DANGER" | "WATCH" | "HOLD";
@@ -122,6 +147,21 @@ const chipStyle: Record<StatusChip, string> = {
   WATCH:  "text-warning bg-warning/10",
   HOLD:   "text-tertiary bg-white/5",
 };
+
+// Strategies that carry premium credit (used to gate totalCredit computation)
+const PREMIUM_STRATEGIES = new Set(["IRON_CONDOR", "SHORT_OPTION", "VERTICAL_SPREAD", "STRANGLE", "STRADDLE"]);
+
+function getPositionStatus(p: Position): "on_track" | "watch" | "at_risk" | "neutral" {
+  const credit = p.fill_credit ?? p.entry_credit;
+  const mark   = p.mark;
+  const dte    = typeof p.dte === "number" && !Number.isNaN(p.dte) ? p.dte : null;
+  if (mark != null && credit != null) {
+    if (mark >= credit * 2.0) return "at_risk";
+    if (mark <= credit * 0.5) return "on_track";
+  }
+  if (dte != null && dte < 14) return "watch";
+  return "neutral";
+}
 
 // ── Candidate helpers ─────────────────────────────────────────────────────────
 
@@ -301,7 +341,7 @@ function AccountCard({ label, accountId, nav, dailyPnl, unrealizedPnl, buyingPow
   );
 }
 
-function NavDashboard({ accounts }: { accounts: Account[] }) {
+function NavDashboard({ accounts, liveNav }: { accounts: Account[]; liveNav: number | null }) {
   const combined = accounts.reduce((acc, a) => ({
     open_positions: acc.open_positions + (a.open_positions ?? 0),
     total_margin:   a.total_margin   != null ? acc.total_margin   + a.total_margin   : acc.total_margin,
@@ -310,12 +350,15 @@ function NavDashboard({ accounts }: { accounts: Account[] }) {
     has_pnl:        acc.has_pnl    || a.total_pnl    != null,
   }), { open_positions: 0, total_margin: 0, total_pnl: 0, has_margin: false, has_pnl: false });
 
-  const combinedNav = accounts.some(a => a.nav != null)
-    ? accounts.reduce((sum, a) => sum + (a.nav ?? 0), 0)
-    : null;
+  // COMBINED NAV: use liveNav (broker total) + paper accounts when available,
+  // otherwise fall back to summing all account navs from reconciler.
+  const paperNav = accounts.filter(a => a.type === "PAPER").reduce((sum, a) => sum + (a.nav ?? 0), 0);
+  const combinedNav = liveNav != null
+    ? paperNav + liveNav
+    : accounts.some(a => a.nav != null) ? accounts.reduce((sum, a) => sum + (a.nav ?? 0), 0) : null;
 
   return (
-    <div className="rounded-xl border border-subtle overflow-hidden mb-6 shadow-lg">
+    <div className="w-full rounded-xl border border-subtle overflow-hidden mb-6 shadow-lg">
       <div className="flex items-center px-4 py-2 bg-card border-b border-subtle">
         <span className="text-[10px] font-mono font-semibold text-tertiary tracking-widest">ACCOUNT SUMMARY</span>
       </div>
@@ -406,6 +449,17 @@ function ScoreBar({ score }: { score: number }) {
   );
 }
 
+// 5-dot score indicator: ●●●○○
+function ScoreDots({ score }: { score: number }) {
+  const filled = Math.min(5, Math.round(score / 20));
+  const color  = score >= 70 ? "text-emerald-400" : score >= 50 ? "text-amber-400" : "text-red-400";
+  return (
+    <span className={`text-[10px] font-mono tracking-tighter ${color}`} title={`Score: ${score}`}>
+      {"●".repeat(filled)}{"○".repeat(5 - filled)}
+    </span>
+  );
+}
+
 // ── Trade Card (Changes 3 + 6) ────────────────────────────────────────────────
 
 function TradeCard({ candidate, freshnessLevel, onApprove, onReject }: {
@@ -425,122 +479,133 @@ function TradeCard({ candidate, freshnessLevel, onApprove, onReject }: {
 
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
-      if (candidate.is_stale || acting) return;
-      if (e.key.toLowerCase() === "a") { setActing(true); onApprove(candidate.id); }
-      if (e.key.toLowerCase() === "r") { setActing(true); onReject(candidate.id);  }
+      if (acting) return;
+      // 'A' only fires when data is live or delayed — not stale
+      if (e.key.toLowerCase() === "a" && freshnessLevel !== "stale" && !candidate.is_stale) {
+        setActing(true); onApprove(candidate.id);
+      }
+      if (e.key.toLowerCase() === "r") { setActing(true); onReject(candidate.id); }
     };
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [candidate.id, candidate.is_stale, acting, onApprove, onReject]);
+  }, [candidate.id, candidate.is_stale, freshnessLevel, acting, onApprove, onReject]);
 
   return (
-    // Change 6: card-shadow keeps recommendation bg/border, adds depth + rounded corners
     <div className={`card-shadow border rounded-xl overflow-hidden ${recBorderBg(rec)}`}>
 
-      {/* Header */}
-      <div className="flex items-start justify-between p-5 border-b border-zinc-800/60">
-        <div>
-          <div className="flex items-center gap-3 mb-1">
-            <span className="text-3xl font-black font-mono tracking-tight text-white">{candidate.symbol}</span>
-            <span className={`text-xs font-mono font-bold px-2.5 py-1 rounded ${recBadgeBg(rec)}`}>
-              {recLabel(rec)}
+      {/* Row 1: Symbol · LLM badge · Score · freshness pill */}
+      <div className="flex items-center justify-between px-3 pt-3 pb-2 border-b border-zinc-800/60">
+        <div className="flex items-center gap-2 flex-wrap">
+          <span className="text-2xl font-black font-mono tracking-tight text-white">{candidate.symbol}</span>
+          <span className={`text-xs font-mono font-bold px-2 py-0.5 rounded ${recBadgeBg(rec)}`}>
+            {recLabel(rec)}
+          </span>
+          {freshnessLevel === "delayed" && (
+            <span className="text-[10px] font-mono px-1.5 py-0.5 rounded-full flex items-center gap-1 text-warning bg-warning/10 border border-warning/20">
+              <Clock size={7} /> Delayed
             </span>
-            <span className="text-xs text-zinc-500 font-mono">{confPct(card?.confidence)} conf</span>
-            {ivRank != null && (
-              <span className="flex items-center gap-1.5 px-2.5 py-1 bg-purple-500/10 border border-purple-500/20 rounded text-xs font-mono">
-                <span className="text-zinc-500">IV RANK</span>
-                <span className="text-purple-400 font-bold">{ivRank.toFixed(0)}</span>
-              </span>
-            )}
-            {/* Correction 2: severity-only freshness pill — no raw age number */}
-            {freshnessLevel === "delayed" && (
-              <span className="text-[10px] font-mono px-2 py-0.5 rounded-full flex items-center gap-1 text-warning bg-warning/10 border border-warning/20">
-                <Clock size={8} /> Delayed
-              </span>
-            )}
-            {freshnessLevel === "stale" && (
-              <span className="text-[10px] font-mono px-2 py-0.5 rounded-full flex items-center gap-1 text-danger bg-negative/10 border border-negative/20">
-                <Clock size={8} /> Stale
-              </span>
-            )}
-          </div>
-          <div className="text-zinc-400 text-sm font-mono">
-            {c?.expiry} · {c?.dte} DTE · ${c?.underlying_price?.toFixed(2)}
-          </div>
+          )}
+          {freshnessLevel === "stale" && (
+            <span className="text-[10px] font-mono px-1.5 py-0.5 rounded-full flex items-center gap-1 text-danger bg-negative/10 border border-negative/20">
+              <Clock size={7} /> Stale
+            </span>
+          )}
         </div>
-        <div className="text-right">
-          <div className="text-xs text-zinc-600 font-mono mb-1">SCORE</div>
-          <div className={`text-4xl font-black font-mono tabular-nums ${scoreColor(candidate.score)}`}>
+        <div className="flex flex-col items-end gap-0.5">
+          <span className={`text-3xl font-black font-mono tabular-nums ${scoreColor(candidate.score)}`}>
             {candidate.score?.toFixed(0)}
-          </div>
+          </span>
+          <ScoreDots score={candidate.score} />
         </div>
       </div>
 
-      {/* Score bar */}
-      <div className="px-5 py-3 border-b border-zinc-800/60">
-        <ScoreBar score={candidate.score} />
+      {/* Row 2: Expiry · DTE · price · IV rank */}
+      <div className="px-3 py-1.5 text-xs font-mono text-zinc-400 border-b border-zinc-800/60">
+        {c?.expiry} · {c?.dte} DTE · ${c?.underlying_price?.toFixed(2)}
+        {ivRank != null && <span className="ml-2 text-purple-400 font-bold">IVR {ivRank.toFixed(0)}</span>}
       </div>
 
-      {/* Strikes */}
+      {/* Row 3: Strike strip */}
       {c && (
-        <div className="grid grid-cols-4 gap-px bg-zinc-800/40 mx-5 my-4 rounded-lg overflow-hidden">
+        <div className="grid grid-cols-4 gap-px bg-zinc-800/40 mx-3 my-2 rounded-lg overflow-hidden">
           {[
             { label: "LONG PUT",   val: c.long_put_strike,   delta: null },
             { label: "SHORT PUT",  val: c.short_put_strike,  delta: c.short_put_delta },
             { label: "SHORT CALL", val: c.short_call_strike, delta: c.short_call_delta },
             { label: "LONG CALL",  val: c.long_call_strike,  delta: null },
           ].map(({ label, val, delta }) => (
-            <div key={label} className="bg-zinc-900 px-3 py-3 text-center">
-              <div className="text-[10px] font-mono text-zinc-600 mb-1.5">{label}</div>
-              <div className="text-lg font-bold font-mono text-white">${val}</div>
+            <div key={label} className="bg-zinc-900 px-2 py-2 text-center">
+              <div className="text-[9px] font-mono text-zinc-600 mb-1">{label}</div>
+              <div className="text-sm font-bold font-mono text-white">${val}</div>
               {delta != null && (
-                <div className="text-[11px] font-mono text-zinc-500 mt-1">Δ {delta?.toFixed(3)}</div>
+                <div className="text-[10px] font-mono text-zinc-500 mt-0.5">Δ {delta?.toFixed(3)}</div>
               )}
             </div>
           ))}
         </div>
       )}
 
-      {/* Economics */}
+      {/* Row 4: Metrics — Credit · Max Loss · R:R · PoP · Width */}
       {c && (
-        <div className="flex flex-wrap gap-5 px-5 pb-4 text-sm font-mono border-b border-zinc-800/60">
-          <div>
-            <div className="text-[10px] text-zinc-600 mb-0.5">CREDIT</div>
-            <span className="text-emerald-400 font-bold">${c.net_credit?.toFixed(2)}</span>
-            <span className="text-zinc-600 text-xs ml-1">(${(c.net_credit * 100).toFixed(0)}/contract)</span>
-          </div>
-          <div>
-            <div className="text-[10px] text-zinc-600 mb-0.5">MAX LOSS</div>
-            <span className="text-red-400 font-bold">${c.max_loss?.toFixed(2)}</span>
-            <span className="text-zinc-600 text-xs ml-1">(${(c.max_loss * 100).toFixed(0)}/contract)</span>
-          </div>
-          <div>
-            <div className="text-[10px] text-zinc-600 mb-0.5">WIDTH</div>
-            <span className="text-zinc-300 font-bold">${c.spread_width}</span>
-          </div>
-          <div>
-            <div className="text-[10px] text-zinc-600 mb-0.5">R:R</div>
-            <span className="text-zinc-300 font-bold">{rr(c.net_credit, c.max_loss)}</span>
-          </div>
-          <div>
-            <div className="text-[10px] text-zinc-600 mb-0.5">POP</div>
-            <span className="text-zinc-300 font-bold">{pop(c.short_put_delta, c.short_call_delta)}</span>
-          </div>
+        <div className="flex items-center gap-4 px-3 pb-2 text-xs font-mono border-b border-zinc-800/60 flex-wrap">
+          <span><span className="text-[10px] text-zinc-600 mr-1">CR</span><span className="text-emerald-400 font-bold">${c.net_credit?.toFixed(2)}</span></span>
+          <span><span className="text-[10px] text-zinc-600 mr-1">LOSS</span><span className="text-red-400 font-bold">${c.max_loss?.toFixed(2)}</span></span>
+          <span><span className="text-[10px] text-zinc-600 mr-1">R:R</span><span className="text-zinc-300 font-bold">{rr(c.net_credit, c.max_loss)}</span></span>
+          <span><span className="text-[10px] text-zinc-600 mr-1">PoP</span><span className="text-zinc-300 font-bold">{pop(c.short_put_delta, c.short_call_delta)}</span></span>
+          <span><span className="text-[10px] text-zinc-600 mr-1">W</span><span className="text-zinc-300 font-bold">${c.spread_width}</span></span>
         </div>
       )}
 
-      {/* Context panel */}
-      {c?.symbol && <ContextPanel symbol={c.symbol} />}
-
-      {/* LLM Summary */}
+      {/* Row 5: Why now — first sentence of LLM thesis */}
       {card?.summary && (
-        <p className="text-zinc-300 text-sm px-5 pb-3 leading-relaxed">{card.summary}</p>
+        <p className="text-zinc-400 text-xs px-3 py-1.5 border-b border-zinc-800/60">
+          {firstSentence(card.summary)}
+        </p>
       )}
 
-      {/* Expand toggle */}
+      {/* Context panel (market events — keeps own fetch) */}
+      {c?.symbol && <ContextPanel symbol={c.symbol} />}
+
+      {/* Row 6: Action buttons — 3 states based on freshnessLevel */}
+      <div className="grid grid-cols-2 gap-2 px-3 py-3 bg-zinc-950">
+        {(freshnessLevel === "stale" || candidate.is_stale) ? (
+          <button
+            disabled
+            className="flex items-center justify-center gap-1.5 py-2.5 rounded-lg font-mono font-bold text-sm cursor-not-allowed opacity-50 bg-zinc-800 text-zinc-500"
+          >
+            <CheckCircle size={13} /> Refresh to Approve
+          </button>
+        ) : freshnessLevel === "delayed" ? (
+          <button
+            onClick={() => { setActing(true); onApprove(candidate.id); }}
+            disabled={acting}
+            title="Data is delayed — verify before approving"
+            className="flex items-center justify-center gap-1.5 py-2.5 rounded-lg border border-amber-500/60 text-amber-400 hover:bg-amber-900/30 font-mono font-bold text-sm transition-all disabled:opacity-50"
+          >
+            <CheckCircle size={13} /> Approve (Delayed)
+          </button>
+        ) : (
+          <button
+            onClick={() => { setActing(true); onApprove(candidate.id); }}
+            disabled={acting}
+            className="flex items-center justify-center gap-1.5 py-2.5 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white font-mono font-bold text-sm transition-all disabled:opacity-50"
+          >
+            <CheckCircle size={13} /> APPROVE (A)
+          </button>
+        )}
+        <button
+          onClick={() => { setActing(true); onReject(candidate.id); }}
+          disabled={acting}
+          className="flex items-center justify-center gap-1.5 py-2.5 rounded-lg border border-red-500/40 text-red-400 hover:bg-red-900/50 font-mono font-bold text-sm transition-all disabled:opacity-50"
+        >
+          <XCircle size={13} /> REJECT (R)
+        </button>
+      </div>
+
+      {/* Show Full Analysis — kept exactly as before */}
       <button
         onClick={() => setExpanded(e => !e)}
-        className="flex items-center gap-1.5 text-xs text-zinc-500 hover:text-zinc-300 transition-colors font-mono px-5 pb-4"
+        className="flex items-center gap-1.5 text-xs text-zinc-500 hover:text-zinc-300 transition-colors font-mono px-3 py-2 w-full border-t border-zinc-800/60"
       >
         {expanded ? <ChevronUp size={11} /> : <ChevronDown size={11} />}
         {expanded ? "HIDE FULL ANALYSIS" : "SHOW FULL ANALYSIS"}
@@ -611,24 +676,6 @@ function TradeCard({ candidate, freshnessLevel, onApprove, onReject }: {
           )}
         </div>
       )}
-
-      {/* Actions */}
-      <div className="grid grid-cols-2 gap-3 p-5 border-t border-zinc-800/60 bg-zinc-950">
-        <button
-          onClick={() => { setActing(true); onApprove(candidate.id); }}
-          disabled={acting || candidate.is_stale}
-          className="flex items-center justify-center gap-2 py-3 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white font-mono font-bold text-sm transition-all disabled:opacity-50 disabled:bg-zinc-800"
-        >
-          <CheckCircle size={15} /> {candidate.is_stale ? "STALE DATA" : "APPROVE (A)"}
-        </button>
-        <button
-          onClick={() => { setActing(true); onReject(candidate.id); }}
-          disabled={acting}
-          className="flex items-center justify-center gap-2 py-3 rounded-lg border border-red-500/40 text-red-400 hover:bg-red-900/50 font-mono font-bold text-sm transition-all disabled:opacity-50"
-        >
-          <XCircle size={15} /> REJECT (R)
-        </button>
-      </div>
     </div>
   );
 }
@@ -666,7 +713,7 @@ function PositionRow({ p }: { p: Position }) {
 
   return (
     // Change 6: card-surface (bg + border + shadow + gradient)
-    <div className="card-surface mb-3 overflow-hidden">
+    <div className="card-surface mb-3 overflow-hidden w-full">
       <button
         onClick={() => setOpen(o => !o)}
         className="w-full flex items-center gap-3 px-5 py-3.5 hover:bg-white/[0.02] transition-colors text-left"
@@ -710,10 +757,10 @@ function PositionRow({ p }: { p: Position }) {
 
       {open && (
         <div className="border-t border-subtle bg-zinc-950">
+          {/* Two-column: ENTRY | CURRENT */}
           <div className="grid grid-cols-2 divide-x divide-subtle">
-            {/* Entry details */}
             <div className="p-4">
-              <div className="text-[10px] font-mono text-tertiary tracking-widest mb-3">ENTRY DETAILS</div>
+              <div className="text-[10px] font-mono text-tertiary tracking-widest mb-3">ENTRY</div>
               <div className="space-y-2 text-sm font-mono">
                 {([
                   [isEquity ? "Avg price"  : "Credit received", credit != null ? `$${credit.toFixed(2)}` : "—"],
@@ -730,24 +777,88 @@ function PositionRow({ p }: { p: Position }) {
                 ))}
               </div>
             </div>
-            {/* P&L */}
             <div className="p-4">
-              <div className="text-[10px] font-mono text-tertiary tracking-widest mb-3">UNREALIZED P/L</div>
+              <div className="text-[10px] font-mono text-tertiary tracking-widest mb-3">CURRENT</div>
               <div className="space-y-2 text-sm font-mono">
                 {([
-                  ["Gross P/L",                    { val: `${pnl >= 0 ? "+" : ""}$${pnl.toFixed(2)}`,                     color: pnl >= 0 ? "text-success" : "text-danger" }],
+                  ["Mark", { val: mark != null ? `$${mark.toFixed(2)}` : "—", color: "text-secondary" }],
+                  ["Gross P/L", { val: `${pnl >= 0 ? "+" : ""}$${pnl.toFixed(2)}`, color: pnl >= 0 ? "text-success" : "text-danger" }],
                   [isEquity ? "% change" : "% of credit", { val: pct != null ? `${pct >= 0 ? "+" : ""}${pct.toFixed(1)}%` : "—", color: (pct ?? 0) >= 0 ? "text-success" : "text-danger" }],
                   ...(!isEquity ? [["50% target", { val: target50 != null ? `$${target50.toFixed(2)}` : "—", color: "text-secondary" }]] as [string, { val: string; color: string }][] : []),
                   ...(!isEquity ? [["200% stop",  { val: stop200  != null ? `$${stop200.toFixed(2)}`  : "—", color: "text-danger"    }]] as [string, { val: string; color: string }][] : []),
                 ] as [string, { val: string; color: string }][]).map(([l, v]) => (
-                  <div key={l} className="flex justify-between">
-                    <span className="text-tertiary">{l}</span>
+                  <div key={l as string} className="flex justify-between">
+                    <span className="text-tertiary">{l as string}</span>
                     <span className={v.color}>{v.val}</span>
                   </div>
                 ))}
               </div>
             </div>
           </div>
+
+          {/* DTE timeline, Greeks, Exit Status, Action buttons — options only */}
+          {!isEquity && (
+            <>
+              {/* DTE timeline: cycle = max(45, dte) so bar never overflows */}
+              {!Number.isNaN(dte) && (
+                <div className="px-4 py-3 border-t border-subtle">
+                  <div className="text-[10px] font-mono text-tertiary tracking-widest mb-2">DTE TIMELINE</div>
+                  {(() => {
+                    const totalDays  = Math.max(45, dte ?? 0);
+                    const elapsed    = totalDays - (dte ?? 0);
+                    const pctElapsed = Math.min(100, Math.max(0, (elapsed / totalDays) * 100));
+                    return (
+                      <>
+                        <div className="relative h-1.5 bg-white/5 rounded-full overflow-hidden">
+                          <div className="h-full rounded-full bg-accent/40" style={{ width: `${pctElapsed}%` }} />
+                        </div>
+                        <div className="flex justify-between text-[10px] font-mono text-tertiary mt-1">
+                          <span>Entry</span>
+                          <span className="text-secondary">{dte}d remaining</span>
+                          <span>{totalDays} DTE</span>
+                        </div>
+                      </>
+                    );
+                  })()}
+                </div>
+              )}
+
+              {/* Greeks placeholder */}
+              <div className="px-4 py-3 border-t border-subtle">
+                <div className="text-[10px] font-mono text-tertiary tracking-widest mb-2">GREEKS</div>
+                <div className="grid grid-cols-4 gap-2 text-xs font-mono text-center">
+                  {(["Delta", "Gamma", "Theta", "Vega"] as const).map(g => (
+                    <div key={g}>
+                      <div className="text-[10px] text-tertiary mb-0.5">{g.toUpperCase()}</div>
+                      <div className="text-secondary">—</div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+
+              {/* Exit status */}
+              <div className="px-4 py-2 border-t border-subtle flex items-center justify-between">
+                <span className="text-[10px] font-mono text-tertiary tracking-widest">EXIT STATUS</span>
+                <span className={`text-[10px] font-mono font-bold ${chipStyle[chipKey]}`}>
+                  {chipKey === "TARGET" ? "50% profit target reached" :
+                   chipKey === "DANGER" ? "Stop loss approaching" :
+                   chipKey === "WATCH"  ? "Time exit zone (<14 DTE)" :
+                   "Monitoring"}
+                </span>
+              </div>
+
+              {/* Action buttons */}
+              <div className="grid grid-cols-3 gap-2 px-4 pb-4 border-t border-subtle pt-3">
+                {(["Close Position", "Roll Position", "Add Note"] as const).map(label => (
+                  <button key={label} disabled title="Coming soon"
+                    className="py-2 text-[10px] font-mono rounded-lg border border-subtle text-tertiary opacity-30 cursor-not-allowed">
+                    {label}
+                  </button>
+                ))}
+              </div>
+            </>
+          )}
+
           {/* Legs */}
           {p.legs && Object.keys(p.legs).length > 0 && (
             <div className="px-4 pb-3 border-t border-subtle">
@@ -778,7 +889,7 @@ function ExitSignalRow({ s, onAction }: {
   const debitToClose  = s.debit_to_close ?? 0;
 
   return (
-    <div className={`rounded-xl border overflow-hidden mb-3 ${
+    <div className={`w-full rounded-xl border overflow-hidden mb-3 ${
       s.reason === "stop_loss" ? "border-red-500/30 bg-red-500/5" : "border-amber-500/20 bg-zinc-900/50"
     }`}>
       <button
@@ -886,10 +997,15 @@ export default function Dashboard() {
   const [positions, setPositions]   = useState<Position[]>([]);
   const [signals, setSignals]       = useState<ExitSignal[]>([]);
   const [accounts, setAccounts]     = useState<Account[]>([]);
+  const [liveNav, setLiveNav]       = useState<number | null>(null);
   const [health, setHealth]         = useState<Health | null>(null);
   const [lastPoll, setLastPoll]     = useState<Date | null>(null);
   const [polling, setPolling]       = useState(false);
   const [tab, setTab]               = useState<"candidates" | "positions" | "exits">("candidates");
+  const [filterAccount,  setFilterAccount]  = useState<string>("all");
+  const [filterStrategy, setFilterStrategy] = useState<string>("all");
+  const [filterStatus,   setFilterStatus]   = useState<string>("all");
+  const [sortBy,         setSortBy]         = useState<string>("default");
 
   // Data age: freshest timestamp from candidates or positions, then health fallback
   const dataAgeSeconds = useMemo(() => {
@@ -913,14 +1029,16 @@ export default function Dashboard() {
   // ── Utility rail derived data ─────────────────────────────────────────────
 
   const portfolioHealth = useMemo(() => {
-    const hasCreditData = positions.some(
-      p => (p.fill_credit ?? p.entry_credit) != null && p.qty != null
-    );
-    const totalCredit = hasCreditData
-      ? positions.reduce((sum, p) => {
-          const credit = p.fill_credit ?? p.entry_credit;
-          return credit != null && p.qty != null ? sum + credit * p.qty * 100 : sum;
-        }, 0)
+    // Only premium-selling strategies with BOTH credit and qty populated.
+    // If either is missing the position is skipped — "$0.00" is worse than "—".
+    const premiumPositions = positions.filter(p => {
+      const strategy = (p.strategy ?? "").toUpperCase();
+      const credit   = p.fill_credit ?? p.entry_credit;
+      return PREMIUM_STRATEGIES.has(strategy) && credit != null && p.qty != null;
+    });
+    const totalCredit = premiumPositions.length > 0
+      ? premiumPositions.reduce((sum, p) =>
+          sum + ((p.fill_credit ?? p.entry_credit ?? 0) * (p.qty ?? 1) * 100), 0)
       : null;
     const expiryClusters = positions.reduce((acc, p) => {
       if (p.expiry) acc[p.expiry] = (acc[p.expiry] ?? 0) + 1;
@@ -939,7 +1057,9 @@ export default function Dashboard() {
       list.push({ severity: "amber", msg: "Data stale · refresh before acting" });
     if (health != null && health.circuit_breaker?.state !== "closed")
       list.push({ severity: "red", msg: "LLM circuit breaker tripped" });
-    if (health?.token?.valid === false)
+    const tokenObj = typeof health?.token === "object" && health.token !== null
+      ? (health.token as TokenData) : null;
+    if (tokenObj?.valid === false)
       list.push({ severity: "red", msg: "Schwab token expired — renew now" });
     signals.slice(0, 3).forEach(s =>
       list.push({ severity: "green", msg: `Exit signal: ${s.symbol}` })
@@ -951,6 +1071,19 @@ export default function Dashboard() {
     return list.slice(0, 5);
   }, [systemLevel, health, signals, candidates, positions]);
 
+  const uniqueAccounts   = useMemo(() => [...new Set(positions.map(p => p.account_id))].sort(), [positions]);
+  const uniqueStrategies = useMemo(() => [...new Set(positions.map(p => (p.strategy ?? "IRON_CONDOR").toUpperCase()))].sort(), [positions]);
+  const filteredPositions = useMemo(() => {
+    let list = positions.slice();
+    if (filterAccount  !== "all") list = list.filter(p => p.account_id === filterAccount);
+    if (filterStrategy !== "all") list = list.filter(p => (p.strategy ?? "IRON_CONDOR").toUpperCase() === filterStrategy);
+    if (filterStatus   !== "all") list = list.filter(p => getPositionStatus(p) === filterStatus);
+    if      (sortBy === "dte_asc") list.sort((a, b) => (a.dte ?? 999) - (b.dte ?? 999));
+    else if (sortBy === "pnl")     list.sort((a, b) => (b.unrealized_pnl ?? 0) - (a.unrealized_pnl ?? 0));
+    else if (sortBy === "credit")  list.sort((a, b) => ((b.fill_credit ?? b.entry_credit ?? 0) - (a.fill_credit ?? a.entry_credit ?? 0)));
+    return list;
+  }, [positions, filterAccount, filterStrategy, filterStatus, sortBy]);
+
   const fetchAll = useCallback(async () => {
     setPolling(true);
     try {
@@ -961,11 +1094,17 @@ export default function Dashboard() {
         axios.get(`${API}/health`).catch(() => ({ data: null })),
         axios.get(`${API}/accounts`).catch(() => ({ data: { accounts: [] } })),
       ]);
+      const accountsData: Account[] = aRes.data.accounts || [];
       setCandidates(cRes.data.candidates || []);
       setPositions(pRes.data.positions || []);
       setSignals(sRes.data.signals || []);
       setHealth(hRes.data);
-      setAccounts(aRes.data.accounts || []);
+      setAccounts(accountsData);
+      // Derive liveNav from LIVE accounts in /accounts — /nav endpoint not needed
+      const derivedLive = accountsData
+        .filter(a => a.type === "LIVE")
+        .reduce((sum, a) => sum + (a.nav ?? 0), 0);
+      setLiveNav(derivedLive > 0 ? derivedLive : null);
       setLastPoll(new Date());
     } catch (e) {
       console.error("Poll failed:", e);
@@ -1038,7 +1177,7 @@ export default function Dashboard() {
         <div className="flex-1 min-w-0">
 
           {/* NAV Dashboard */}
-          {accounts.length > 0 && <NavDashboard accounts={accounts} />}
+          {accounts.length > 0 && <NavDashboard accounts={accounts} liveNav={liveNav} />}
 
           {/* Tab bar */}
           <div className="flex gap-1 mb-6 border-b border-subtle pb-px">
@@ -1085,7 +1224,7 @@ export default function Dashboard() {
                 <div className="text-xs mt-2 text-tertiary font-mono">Polling every 5s · Awaiting strategy engine output</div>
               </div>
             ) : (
-              <div className="grid grid-cols-1 xl:grid-cols-2 gap-6">
+              <div className={`grid gap-6 ${candidates.length > 1 ? "grid-cols-1 xl:grid-cols-2" : "grid-cols-1"}`}>
                 {candidates.map(c => (
                   <TradeCard key={c.id} candidate={c} freshnessLevel={systemLevel} onApprove={handleApprove} onReject={handleReject} />
                 ))}
@@ -1099,7 +1238,40 @@ export default function Dashboard() {
                 No open positions found in database.
               </div>
             ) : (
-              <div className="space-y-0 max-w-4xl">{positions.map(p => <PositionRow key={p.id} p={p} />)}</div>
+              <>
+                {/* Filter / sort controls */}
+                <div className="flex flex-wrap gap-2 mb-4 font-mono text-xs">
+                  <select value={filterAccount} onChange={e => setFilterAccount(e.target.value)}
+                    className="bg-card border border-subtle rounded px-2 py-1 text-secondary focus:outline-none focus:border-focus">
+                    <option value="all">All accounts</option>
+                    {uniqueAccounts.map(a => <option key={a} value={a}>{a === "PAPER" ? "PAPER" : `···${a.slice(-4)}`}</option>)}
+                  </select>
+                  <select value={filterStrategy} onChange={e => setFilterStrategy(e.target.value)}
+                    className="bg-card border border-subtle rounded px-2 py-1 text-secondary focus:outline-none focus:border-focus">
+                    <option value="all">All strategies</option>
+                    {uniqueStrategies.map(s => <option key={s} value={s}>{strategyBadge[s] ?? s}</option>)}
+                  </select>
+                  <select value={filterStatus} onChange={e => setFilterStatus(e.target.value)}
+                    className="bg-card border border-subtle rounded px-2 py-1 text-secondary focus:outline-none focus:border-focus">
+                    <option value="all">All statuses</option>
+                    <option value="on_track">On track</option>
+                    <option value="watch">Watch</option>
+                    <option value="at_risk">At risk</option>
+                    <option value="neutral">Neutral</option>
+                  </select>
+                  <select value={sortBy} onChange={e => setSortBy(e.target.value)}
+                    className="bg-card border border-subtle rounded px-2 py-1 text-secondary focus:outline-none focus:border-focus">
+                    <option value="default">Sort: default</option>
+                    <option value="dte_asc">Sort: DTE ↑</option>
+                    <option value="pnl">Sort: P/L</option>
+                    <option value="credit">Sort: credit</option>
+                  </select>
+                  {filteredPositions.length !== positions.length && (
+                    <span className="text-tertiary self-center">{filteredPositions.length} of {positions.length}</span>
+                  )}
+                </div>
+                <div className="space-y-0 w-full">{filteredPositions.map(p => <PositionRow key={p.id} p={p} />)}</div>
+              </>
             )
           )}
 
@@ -1109,7 +1281,7 @@ export default function Dashboard() {
                 No pending exit signals triggered.
               </div>
             ) : (
-              <div className="space-y-4 max-w-4xl">{signals.map(s => <ExitSignalRow key={s.id} s={s} onAction={handleSignalAction} />)}</div>
+              <div className="space-y-4 w-full">{signals.map(s => <ExitSignalRow key={s.id} s={s} onAction={handleSignalAction} />)}</div>
             )
           )}
         </div>
@@ -1138,7 +1310,7 @@ export default function Dashboard() {
                   <div className="text-[10px] text-tertiary mb-1.5">EXPIRY CLUSTERS</div>
                   <div className="text-xs text-secondary leading-relaxed">
                     {portfolioHealth.sortedExpiries.map(([exp, count], i) => (
-                      <span key={exp}>{i > 0 ? " · " : ""}{exp}: {count}</span>
+                      <span key={exp}>{i > 0 ? " · " : ""}{formatExpiry(exp)}: {count}</span>
                     ))}
                   </div>
                   {portfolioHealth.expiryConcentration && (
@@ -1182,13 +1354,26 @@ export default function Dashboard() {
               </div>
               <div className="flex justify-between items-center text-xs">
                 <span className="text-tertiary">Token</span>
-                {health?.token?.valid === false ? (
-                  <span className="text-danger">EXPIRED</span>
-                ) : health?.token?.days_remaining != null ? (
-                  <span className="text-success">{health.token.days_remaining}d remaining</span>
-                ) : (
-                  <span className="text-tertiary">—</span>
-                )}
+                {(() => {
+                  const raw = health?.token;
+                  if (raw == null) return <span className="text-tertiary">—</span>;
+                  // Structured object: valid + days_remaining
+                  if (typeof raw === "object") {
+                    const tok = raw as TokenData;
+                    if (tok.valid === false)
+                      return <span className="text-danger">EXPIRED</span>;
+                    if (tok.days_remaining != null)
+                      return <span className={tok.days_remaining <= 3 ? "text-warning" : "text-success"}>{tok.days_remaining}d remaining</span>;
+                    return <span className="text-tertiary">—</span>;
+                  }
+                  // String sentinel from backend — show it directly so operator can see why
+                  const label: Record<string, string> = {
+                    missing:        "No token file",
+                    no_expiry_date: "Present (no expiry)",
+                  };
+                  const display = label[raw] ?? raw;
+                  return <span className="text-tertiary text-[10px]">{display}</span>;
+                })()}
               </div>
               <div className="flex justify-between items-center text-xs">
                 <span className="text-tertiary">Agent loop</span>
@@ -1197,10 +1382,13 @@ export default function Dashboard() {
                   Running
                 </span>
               </div>
-              {(["Last reconcile", "Next reconcile"] as const).map(l => (
+              {([
+                ["Last reconcile", "Not Initialized"],
+                ["Next reconcile", "Waiting for Loop"],
+              ] as [string, string][]).map(([l, v]) => (
                 <div key={l} className="flex justify-between text-xs">
                   <span className="text-tertiary">{l}</span>
-                  <span className="text-secondary">--</span>
+                  <span className="text-tertiary italic">{v}</span>
                 </div>
               ))}
             </div>
@@ -1214,14 +1402,14 @@ export default function Dashboard() {
               <button
                 disabled
                 title="Coming soon"
-                className="w-full py-2 text-xs font-mono rounded-lg border border-subtle text-tertiary opacity-40 cursor-not-allowed"
+                className="w-full py-2 text-xs font-mono rounded-lg border border-subtle text-tertiary opacity-30 cursor-not-allowed"
               >
                 ⟳ Force Reconcile
               </button>
               <button
                 disabled
                 title="Coming soon"
-                className="w-full py-2 text-xs font-mono rounded-lg border border-subtle text-tertiary opacity-40 cursor-not-allowed"
+                className="w-full py-2 text-xs font-mono rounded-lg border border-subtle text-tertiary opacity-30 cursor-not-allowed"
               >
                 ⊞ Rescan Candidates
               </button>

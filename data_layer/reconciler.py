@@ -49,6 +49,11 @@ logger = logging.getLogger(__name__)
 
 DB_URL = f"postgresql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
 
+# Asset types that Schwab classifies as share-based holdings (strategy = "EQUITY").
+# ETF / closed-end fund / mutual fund / collective investment behave identically
+# to plain EQUITY for reconciler purposes — they have a qty and an avg cost basis.
+EQUITY_LIKE_TYPES = {"EQUITY", "ETF", "CLOSED_END_FUND", "MUTUAL_FUND", "COLLECTIVE_INVESTMENT"}
+
 PROJECT_ROOT   = Path(__file__).resolve().parent.parent
 RECONCILER_LOG = PROJECT_ROOT / "logs" / "reconciler.log"
 RECONCILER_LOG.parent.mkdir(parents=True, exist_ok=True)
@@ -153,7 +158,7 @@ def _parse_schwab_positions(
 
     for pos in positions:
         instr = pos.get("instrument") or {}
-        if instr.get("assetType") != "EQUITY":
+        if instr.get("assetType") not in EQUITY_LIKE_TYPES:
             continue
         symbol   = instr.get("symbol") or instr.get("cusip") or "UNKNOWN"
         long_qty  = int(pos.get("longQuantity")  or 0)
@@ -188,6 +193,9 @@ def _parse_schwab_positions(
         )
 
     # ── 1. Filter to OPTION positions only ────────────────────────────────────
+    # assetType == "OPTION" is the only type we parse as option legs.
+    # EQUITY_LIKE_TYPES (ETF, CLOSED_END_FUND, etc.) are share-based and already
+    # handled above — they must NOT enter the option-leg path.
     option_legs: list[dict] = []
     for pos in positions:
         instr = pos.get("instrument") or {}
