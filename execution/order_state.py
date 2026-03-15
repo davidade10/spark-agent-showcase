@@ -241,6 +241,23 @@ def migrate_orders_schema(engine) -> None:
             WHERE position_key IS NOT NULL
         """))
 
+        # One-time migration: add account_id suffix to equity/non-condor position_keys
+        # that were created before the cross-account dedup fix.
+        # Iron condor keys (colon-namespaced) are left untouched.
+        # Idempotent: the NOT LIKE guard skips rows that already have the suffix.
+        conn.execute(text("""
+            UPDATE positions
+            SET position_key = position_key || ':' || account_id
+            WHERE strategy IN (
+                'EQUITY', 'SHORT_OPTION', 'LONG_OPTION',
+                'VERTICAL_SPREAD', 'STRANGLE', 'STRADDLE', 'UNKNOWN'
+            )
+              AND position_key IS NOT NULL
+              AND position_key NOT LIKE '%:' || account_id
+              AND account_id IS NOT NULL
+              AND account_id != 'PAPER'
+        """))
+
     logger.info("migrate_orders_schema: orders + positions schema verified/migrated")
 
 

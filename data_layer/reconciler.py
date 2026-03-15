@@ -170,7 +170,7 @@ def _parse_schwab_positions(
             if isinstance(v, (int, float)) and float(v) > 0:
                 avg_price = float(v)
                 break
-        position_key = f"{symbol}:EQUITY"
+        position_key = f"{symbol}:EQUITY:{account_id}"
         leg_detail = [{"symbol": symbol, "qty": quantity, "avg_price": avg_price}]
         non_condors.append({
             "symbol":             symbol,
@@ -415,7 +415,7 @@ def _parse_schwab_positions(
             if s is not None
         ]
         position_key = (
-            f"{underlying}_{expiry}_{strategy}_"
+            f"{underlying}_{expiry}_{strategy}_{account_id}_"
             + ("-".join(strike_parts) if strike_parts else "nostrike")
         )
 

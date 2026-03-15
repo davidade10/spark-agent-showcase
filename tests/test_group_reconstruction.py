@@ -117,7 +117,7 @@ class TestNonCondorGrouping:
         assert eq["symbol"]            == "AAPL"
         assert eq["expiry"]            is None
         assert eq["legs"]              == 1
-        assert eq["position_key"]      == "AAPL:EQUITY"
+        assert eq["position_key"]      == "AAPL:EQUITY:5760"
 
     def test_non_condor_position_key_uses_underscore_namespace(self):
         """Non-condor keys must use '_' delimiters to avoid colliding with condor ':' keys."""
