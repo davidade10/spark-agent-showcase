@@ -69,12 +69,18 @@ interface Event {
   symbol: string; event_type: string; event_ts: string; days_away: number;
 }
 
-interface TokenData { valid: boolean; days_remaining: number }
+interface TokenData {
+  valid?: boolean;
+  days_remaining?: number | null;
+}
+
 interface Health {
-  circuit_breaker: { state: string; failures: number; attempts: number };
-  data_freshness: { last_snapshot_minutes_ago: number | null; is_stale: boolean };
-  // Backend returns object when expiry is known; string sentinel ("present"|"missing"|"error:…") otherwise
-  token?: TokenData | string | null;
+  status: string;
+  checks: {
+    circuit_breaker: { state: string; failures: number; attempts: number };
+    data_freshness: { last_snapshot_minutes_ago: number | null; is_stale: boolean };
+    token?: TokenData | string | null;
+  };
 }
 
 // ── Freshness helpers ─────────────────────────────────────────────────────────
@@ -986,7 +992,7 @@ function ExitSignalRow({ s, onAction }: {
           </div>
         </div>
       )}
-    </div>
+</div>
   );
 }
 
@@ -1007,19 +1013,35 @@ export default function Dashboard() {
   const [filterStatus,   setFilterStatus]   = useState<string>("all");
   const [sortBy,         setSortBy]         = useState<string>("default");
 
+// --- Token Health Logic ---
+const rawToken = (health as any)?.checks?.token;
+  
+let tokenColor = "text-zinc-400";
+let tokenDot = "bg-zinc-600";
+let tokenLabel = "--";
+
+if (rawToken) {
+  if (typeof rawToken === "object" && rawToken.days_remaining != null) {
+    tokenLabel = `${rawToken.days_remaining.toFixed(1)}d left`;
+    tokenDot = rawToken.days_remaining > 1 ? "bg-green-500" : "bg-red-500 animate-pulse";
+    tokenColor = rawToken.days_remaining > 1 ? "text-green-500" : "text-red-500 font-bold";
+  } else if (rawToken === "no_expiry_date" || rawToken === "present") {
+    tokenLabel = "ACTIVE";
+    tokenDot = "bg-green-500";
+    tokenColor = "text-green-500";
+  } else {
+    tokenLabel = "ERROR";
+    tokenDot = "bg-red-500";
+    tokenColor = "text-red-500";
+  }
+}
   // Data age: freshest timestamp from candidates or positions, then health fallback
   const dataAgeSeconds = useMemo(() => {
-    const timestamps: number[] = [];
-    candidates.forEach(c => { if (c.created_at) timestamps.push(new Date(c.created_at).getTime()); });
-    positions.forEach(p  => { if (p.opened_at)  timestamps.push(new Date(p.opened_at).getTime());  });
-    if (timestamps.length > 0) {
-      return Math.floor((Date.now() - Math.max(...timestamps)) / 1000);
-    }
-    if (health?.data_freshness?.last_snapshot_minutes_ago != null) {
-      return health.data_freshness.last_snapshot_minutes_ago * 60;
+    if (health?.checks?.data_freshness?.last_snapshot_minutes_ago != null) {
+      return Math.floor(health.checks.data_freshness.last_snapshot_minutes_ago * 60);
     }
     return null;
-  }, [candidates, positions, health]);
+  }, [health]);
 
   const systemLevel: FreshnessLevel = useMemo(() => {
     if (dataAgeSeconds === null) return "unknown";
@@ -1029,8 +1051,6 @@ export default function Dashboard() {
   // ── Utility rail derived data ─────────────────────────────────────────────
 
   const portfolioHealth = useMemo(() => {
-    // Only premium-selling strategies with BOTH credit and qty populated.
-    // If either is missing the position is skipped — "$0.00" is worse than "—".
     const premiumPositions = positions.filter(p => {
       const strategy = (p.strategy ?? "").toUpperCase();
       const credit   = p.fill_credit ?? p.entry_credit;
@@ -1055,10 +1075,12 @@ export default function Dashboard() {
     const list: { severity: "red" | "amber" | "green" | "gray"; msg: string }[] = [];
     if (systemLevel === "stale")
       list.push({ severity: "amber", msg: "Data stale · refresh before acting" });
-    if (health != null && health.circuit_breaker?.state !== "closed")
+    if (health != null && health.checks?.circuit_breaker?.state !== "closed")
       list.push({ severity: "red", msg: "LLM circuit breaker tripped" });
-    const tokenObj = typeof health?.token === "object" && health.token !== null
-      ? (health.token as TokenData) : null;
+    const tokenObj =
+    typeof health?.checks?.token === "object" && health.checks.token !== null
+      ? (health.checks.token as TokenData)
+      : null;
     if (tokenObj?.valid === false)
       list.push({ severity: "red", msg: "Schwab token expired — renew now" });
     signals.slice(0, 3).forEach(s =>
@@ -1100,7 +1122,6 @@ export default function Dashboard() {
       setSignals(sRes.data.signals || []);
       setHealth(hRes.data);
       setAccounts(accountsData);
-      // Derive liveNav from LIVE accounts in /accounts — /nav endpoint not needed
       const derivedLive = accountsData
         .filter(a => a.type === "LIVE")
         .reduce((sum, a) => sum + (a.nav ?? 0), 0);
@@ -1148,8 +1169,6 @@ export default function Dashboard() {
 
   return (
     <div className="min-h-screen bg-page text-primary">
-
-      {/* Change 2: Operator Bar — single sticky header strip */}
       <header className="sticky top-0 z-10 bg-card/95 backdrop-blur">
         <OperatorBar
           dataAgeSeconds={dataAgeSeconds}
@@ -1161,8 +1180,7 @@ export default function Dashboard() {
         />
       </header>
 
-      {/* Circuit breaker alert banner */}
-      {health?.circuit_breaker?.state === "open" && (
+      {health?.checks?.circuit_breaker?.state === "open" && (
         <div className="flex items-center gap-3 px-6 py-3 bg-red-900/30 border-b border-red-900/50 text-danger font-mono text-sm">
           <AlertTriangle size={15} />
           <span className="font-bold">CIRCUIT BREAKER OPEN</span>
@@ -1170,16 +1188,10 @@ export default function Dashboard() {
         </div>
       )}
 
-      {/* Two-column layout: main content + utility rail */}
       <div className="flex flex-col xl:flex-row gap-6 p-6 items-start">
-
-        {/* ── Left column — main content ──────────────────────────────────── */}
         <div className="flex-1 min-w-0">
-
-          {/* NAV Dashboard */}
           {accounts.length > 0 && <NavDashboard accounts={accounts} liveNav={liveNav} />}
 
-          {/* Tab bar */}
           <div className="flex gap-1 mb-6 border-b border-subtle pb-px">
             {([
               ["candidates", "Pending",      candidates.length],
@@ -1215,7 +1227,6 @@ export default function Dashboard() {
             })}
           </div>
 
-          {/* Tab content */}
           {tab === "candidates" && (
             candidates.length === 0 ? (
               <div className="text-center py-20 border border-dashed border-subtle rounded-xl bg-card/30">
@@ -1239,7 +1250,6 @@ export default function Dashboard() {
               </div>
             ) : (
               <>
-                {/* Filter / sort controls */}
                 <div className="flex flex-wrap gap-2 mb-4 font-mono text-xs">
                   <select value={filterAccount} onChange={e => setFilterAccount(e.target.value)}
                     className="bg-card border border-subtle rounded px-2 py-1 text-secondary focus:outline-none focus:border-focus">
@@ -1286,19 +1296,16 @@ export default function Dashboard() {
           )}
         </div>
 
-        {/* ── Right column — utility rail ──────────────────────────────────── */}
         <div className="w-full xl:w-80 xl:shrink-0 space-y-4">
-
-          {/* Panel 1 — Portfolio Health */}
           <div className="card-surface p-4 font-mono">
             <div className="text-[10px] text-tertiary tracking-widest mb-3">🛡 PORTFOLIO HEALTH</div>
             <div className="space-y-2">
               {([
                 ["Open positions",   positions.length > 0 ? String(positions.length) : "—"],
-                ["Total credit",     portfolioHealth.totalCredit != null ? `$${portfolioHealth.totalCredit.toFixed(2)}` : "—"],
+                ["Total credit",      portfolioHealth.totalCredit != null ? `$${portfolioHealth.totalCredit.toFixed(2)}` : "—"],
                 ["Net delta",        "—"],
                 ["Theta / day",      "—"],
-                ["Vega",             "—"],
+                ["Vega",              "—"],
               ] as [string, string][]).map(([l, v]) => (
                 <div key={l} className="flex justify-between text-xs">
                   <span className="text-tertiary">{l}</span>
@@ -1331,15 +1338,14 @@ export default function Dashboard() {
             </div>
           </div>
 
-          {/* Panel 2 — System Status */}
           <div className="card-surface p-4 font-mono">
             <div className="text-[10px] text-tertiary tracking-widest mb-3">⚡ SYSTEM STATUS</div>
             <div className="space-y-2 mb-4">
               <div className="flex justify-between items-center text-xs">
                 <span className="text-tertiary">LLM</span>
-                <span className={`flex items-center gap-1 ${health?.circuit_breaker?.state === "closed" ? "text-success" : "text-danger"}`}>
+                <span className={`flex items-center gap-1 ${health?.checks?.circuit_breaker?.state === "closed" ? "text-success" : "text-danger"}`}>
                   <span className="inline-block w-1.5 h-1.5 rounded-full bg-current" />
-                  {health?.circuit_breaker?.state === "closed" ? "Online" : "Tripped"}
+                  {health?.checks?.circuit_breaker?.state === "closed" ? "Online" : "Tripped"}
                 </span>
               </div>
               <div className="flex justify-between items-center text-xs">
@@ -1352,39 +1358,23 @@ export default function Dashboard() {
                   {systemLevel.toUpperCase()}
                 </span>
               </div>
-              <div className="flex justify-between items-center text-xs">
-                <span className="text-tertiary">Token</span>
-                {(() => {
-                  const raw = health?.token;
-                  if (raw == null) return <span className="text-tertiary">—</span>;
-                  // Structured object: valid + days_remaining
-                  if (typeof raw === "object") {
-                    const tok = raw as TokenData;
-                    if (tok.valid === false)
-                      return <span className="text-danger">EXPIRED</span>;
-                    if (tok.days_remaining != null)
-                      return <span className={tok.days_remaining <= 3 ? "text-warning" : "text-success"}>{tok.days_remaining}d remaining</span>;
-                    return <span className="text-tertiary">—</span>;
-                  }
-                  // String sentinel from backend — show it directly so operator can see why
-                  const label: Record<string, string> = {
-                    missing:        "No token file",
-                    no_expiry_date: "Present (no expiry)",
-                  };
-                  const display = label[raw] ?? raw;
-                  return <span className="text-tertiary text-[10px]">{display}</span>;
-                })()}
+              <div className="flex justify-between items-center text-xs py-1">
+                <span className="text-tertiary uppercase tracking-tight">Schwab Token</span>
+                <span className={`${tokenColor} flex items-center gap-1.5`}>
+                  <span className={`inline-block w-1.5 h-1.5 rounded-full ${tokenDot}`} />
+                  {tokenLabel}
+                </span>
               </div>
-              <div className="flex justify-between items-center text-xs">
-                <span className="text-tertiary">Agent loop</span>
-                <span className="text-success flex items-center gap-1">
-                  <span className="inline-block w-1.5 h-1.5 rounded-full bg-current" />
+              <div className="flex justify-between items-center text-xs py-1">
+                <span className="text-tertiary uppercase tracking-tight">Agent Loop</span>
+                <span className="text-success flex items-center gap-1.5">
+                  <span className="inline-block w-1.5 h-1.5 rounded-full bg-green-500" />
                   Running
                 </span>
               </div>
               {([
-                ["Last reconcile", "Not Initialized"],
-                ["Next reconcile", "Waiting for Loop"],
+                ["Last reconcile", health?.checks?.reconciler_log || "Not Initialized"],
+                ["Next reconcile", "Auto-scheduled"],
               ] as [string, string][]).map(([l, v]) => (
                 <div key={l} className="flex justify-between text-xs">
                   <span className="text-tertiary">{l}</span>
@@ -1393,30 +1383,12 @@ export default function Dashboard() {
               ))}
             </div>
             <div className="space-y-2 border-t border-subtle pt-3">
-              <button
-                onClick={fetchAll}
-                className="w-full py-2 text-xs font-mono rounded-lg border border-subtle text-secondary hover:text-primary hover:border-focus transition-colors flex items-center justify-center gap-1.5"
-              >
+              <button onClick={fetchAll} className="w-full py-2 text-xs font-mono rounded-lg border border-subtle text-secondary hover:text-primary hover:border-focus transition-colors flex items-center justify-center gap-1.5">
                 ↻ Refresh Prices
-              </button>
-              <button
-                disabled
-                title="Coming soon"
-                className="w-full py-2 text-xs font-mono rounded-lg border border-subtle text-tertiary opacity-30 cursor-not-allowed"
-              >
-                ⟳ Force Reconcile
-              </button>
-              <button
-                disabled
-                title="Coming soon"
-                className="w-full py-2 text-xs font-mono rounded-lg border border-subtle text-tertiary opacity-30 cursor-not-allowed"
-              >
-                ⊞ Rescan Candidates
               </button>
             </div>
           </div>
 
-          {/* Panel 3 — Alerts Feed */}
           <div className="card-surface p-4 font-mono">
             <div className="text-[10px] text-tertiary tracking-widest mb-3">⚡ ALERTS</div>
             {railAlerts.length === 0 ? (
@@ -1437,7 +1409,6 @@ export default function Dashboard() {
               </div>
             )}
           </div>
-
         </div>
       </div>
     </div>

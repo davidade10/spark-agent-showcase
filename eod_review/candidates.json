@@ -1,0 +1,66 @@
+{
+  "candidates": [
+    {
+      "id": 105,
+      "created_at": "2026-03-12T14:11:38.210232+00:00",
+      "snapshot_id": 3,
+      "symbol": "NVDA",
+      "strategy": "iron_condor",
+      "score": 71.19,
+      "account_id": "primary",
+      "gate_result": "approved",
+      "candidate_json": {
+        "dte": 50,
+        "expiry": "2026-05-01",
+        "symbol": "NVDA",
+        "iv_rank": null,
+        "max_loss": 3.84,
+        "net_credit": 1.16,
+        "spread_width": 5.0,
+        "long_put_strike": 150.0,
+        "short_put_delta": -0.158,
+        "long_call_strike": 220.0,
+        "short_call_delta": 0.141,
+        "short_put_strike": 155.0,
+        "underlying_price": 182.98,
+        "short_call_strike": 215.0
+      },
+      "llm_card": {
+        "_meta": {
+          "model": "llama3.2:3b",
+          "context_block": "Account focus: primary\nOpen positions (same symbol):\n- acct=35148096 key=NVDA:2026-04-17:140.0-150.0:210.0-220.0:1 exp=2026-04-17 dte=36 credit=212.36 dtc=149.0\nRecent exit signals (last 30d): none\nLatest underlying quote: {'ts': datetime.datetime(2026, 3, 13, 19, 52, 53, 495725, tzinfo=datetime.timezone.utc), 'price': 180.23, 'iv_rank': None}",
+          "trade_candidate_id": 105
+        },
+        "summary": "NVDA Iron Condor trade with a net credit of 1.16, suitable for a primary account focus, given a score of 71.19/100.",
+        "rationale": [
+          "The trade has a net credit of 1.16, which is a reasonable amount for a primary account focus.",
+          "The score breakdown indicates no significant concerns, with all IV rank, credit-width, delta, and DTE scores being N/A.",
+          "The credit/max-loss ratio is 0.141/0.158, which is within a reasonable range."
+        ],
+        "red_flags": [
+          "The spread width of 5.0 may be relatively narrow, which could increase the risk of a large move in the underlying price."
+        ],
+        "confidence": 0.71,
+        "numbers_used": {
+          "dte": 50,
+          "score": 71.19,
+          "max_loss": 3.84,
+          "net_credit": 1.16
+        },
+        "recommendation": "yes",
+        "market_environment": "The IV rank is N/A, indicating a lack of historical context. The latest underlying quote shows a price of 180.23, with no recent exit signals or open positions for the same symbol.",
+        "setup_specific_risks": [
+          "The spread width of 5.0 may be relatively narrow, which could increase the risk of a large move in the underlying price.",
+          "The IV rank being N/A may indicate a lack of historical context, which could impact the trade's performance."
+        ],
+        "conditions_if_conditional": [
+          "Only populate if recommendation is conditional. Otherwise empty list."
+        ]
+      },
+      "snapshot_ts": "2026-03-12T14:00:40.620003+00:00",
+      "age_minutes": 6144.8,
+      "is_stale": true
+    }
+  ],
+  "count": 1
+}

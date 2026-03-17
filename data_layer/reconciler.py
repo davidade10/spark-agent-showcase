@@ -409,7 +409,11 @@ def _parse_schwab_positions(
         lc_strike = _occ_strike(long_calls[0])  if long_calls  else None
         lp_strike = _occ_strike(long_puts[0])   if long_puts   else None
 
-        # Position key for non-condors — includes strategy to avoid collision
+        # Position key for non-condors — includes strategy to avoid collision.
+        # Suffix :{account_id} is appended to match the format produced by the
+        # migrate_orders_schema one-time migration (idempotent: migration guard
+        # checks NOT LIKE '%:' || account_id, so rows with this suffix won't be
+        # double-suffixed on subsequent migrate runs).
         strike_parts = [
             str(s) for s in (lp_strike, sp_strike, sc_strike, lc_strike)
             if s is not None
@@ -417,6 +421,7 @@ def _parse_schwab_positions(
         position_key = (
             f"{underlying}_{expiry}_{strategy}_{account_id}_"
             + ("-".join(strike_parts) if strike_parts else "nostrike")
+            + f":{account_id}"
         )
 
         non_condors.append({
@@ -468,12 +473,18 @@ def _match_position(
 
     sym      = schwab_pos["symbol"]
     strategy = schwab_pos.get("strategy", "IRON_CONDOR")
+    sw_acct  = schwab_pos.get("account_id")
 
-    # EQUITY: match by symbol + strategy only
+    # EQUITY: match by symbol + strategy + account_id (prevents cross-account collision
+    # when the same equity symbol is held in multiple accounts).
     if strategy == "EQUITY":
         for db in db_positions:
-            if db.get("symbol") == sym and db.get("strategy") == "EQUITY":
-                return db
+            if db.get("symbol") != sym or db.get("strategy") != "EQUITY":
+                continue
+            # Enforce account match when both sides have account_id populated
+            if sw_acct and db.get("account_id") and db.get("account_id") != sw_acct:
+                continue
+            return db
         return None
 
     expiry = schwab_pos.get("expiry")  # already normalised
@@ -486,6 +497,11 @@ def _match_position(
         # in legacy data, so only enforce for non-condors)
         db_strategy = db.get("strategy") or "IRON_CONDOR"
         if strategy != "IRON_CONDOR" and db_strategy != strategy:
+            continue
+
+        # For non-condor positions, also enforce account_id to prevent cross-account
+        # false matches (e.g. same option symbol/strike in both 5760 and 8096).
+        if strategy != "IRON_CONDOR" and sw_acct and db.get("account_id") and db.get("account_id") != sw_acct:
             continue
 
         db_expiry = db.get("expiry")
@@ -680,6 +696,7 @@ def reconcile(engine, schwab_client) -> dict:
     with engine.connect() as conn:
         db_rows = conn.execute(text("""
             SELECT id, account_id, symbol, expiry,
+                   strategy,
                    long_put_strike, short_put_strike,
                    short_call_strike, long_call_strike,
                    quantity, fill_credit, status, position_key,
@@ -965,33 +982,41 @@ def run_scheduled_reconciliation() -> None:
     )
 
     engine = create_engine(DB_URL)
-    migrate_orders_schema(engine)
-
+    
     try:
-        client = get_schwab_client()
-    except Exception as e:
-        logger.error(f"run_scheduled_reconciliation: could not init Schwab client — {e}")
-        return
+        migrate_orders_schema(engine)
 
-    ts = datetime.now(timezone.utc).isoformat()
+        try:
+            client = get_schwab_client()
+        except Exception as e:
+            logger.error(f"run_scheduled_reconciliation: could not init Schwab client - {e}")
+            return  # The finally block will still run before this return executes!
 
-    pos_summary = reconcile(engine, client)
-    nav_summary = reconcile_nav(engine, client)
+        ts = datetime.now(timezone.utc).isoformat()
 
-    full_summary = {
-        "ts":          ts,
-        "positions":   pos_summary,
-        "nav":         nav_summary,
-    }
+        pos_summary = reconcile(engine, client)
+        nav_summary = reconcile_nav(engine, client)
 
-    logger.info(f"Reconciliation summary: {json.dumps(full_summary, default=str)}")
+        full_summary = {
+            "ts": ts,
+            "positions": pos_summary,
+            "nav": nav_summary,
+        }
 
-    # Append to reconciler.log
-    try:
-        with open(RECONCILER_LOG, "a") as f:
-            f.write(json.dumps(full_summary, default=str) + "\n")
-    except Exception as e:
-        logger.warning(f"Could not write to reconciler.log — {e}")
+        logger.info(f"Reconciliation summary: {json.dumps(full_summary, default=str)}")
+
+        # Append to reconciler.log
+        try:
+            with open(RECONCILER_LOG, "a") as f:
+                f.write(json.dumps(full_summary, default=str) + "\n")
+        except Exception as e:
+            logger.error(f"Failed to append to reconciler log: {e}")
+
+    finally:
+        # THIS IS THE CURE
+        engine.dispose()
+        logger.info("Database engine disposed to prevent connection leaks.")
+   
 
 
 # ── CLI entry point ───────────────────────────────────────────────────────────

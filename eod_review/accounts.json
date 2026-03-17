@@ -1,0 +1,37 @@
+{
+  "accounts": [
+    {
+      "account_id": "8096",
+      "type": "LIVE",
+      "nav": 8441.24,
+      "open_positions": 8,
+      "buying_power": null,
+      "daily_pnl": null,
+      "total_credit": null,
+      "total_margin": null,
+      "total_pnl": null
+    },
+    {
+      "account_id": "5760",
+      "type": "LIVE",
+      "nav": 6763.24,
+      "open_positions": 5,
+      "buying_power": null,
+      "daily_pnl": null,
+      "total_credit": null,
+      "total_margin": null,
+      "total_pnl": null
+    },
+    {
+      "account_id": "PAPER",
+      "type": "PAPER",
+      "nav": 20000.0,
+      "open_positions": 1,
+      "buying_power": null,
+      "daily_pnl": null,
+      "total_credit": null,
+      "total_margin": null,
+      "total_pnl": null
+    }
+  ]
+}

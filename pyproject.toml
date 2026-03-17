@@ -19,8 +19,15 @@ dependencies = [
     "python-dotenv>=1.2.2",
     "pytz>=2026.1.post1",
     "requests>=2.32.5",
+    "apscheduler>=3.10.0",
     "schedule>=1.2.2",
     "schwab-py>=1.5.1",
     "sqlalchemy>=2.0.48",
     "uvicorn>=0.41.0",
+]
+
+[dependency-groups]
+dev = [
+    "httpx>=0.28.1",
+    "pytest>=9.0.2",
 ]

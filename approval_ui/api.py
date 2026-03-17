@@ -43,6 +43,9 @@ logger = logging.getLogger(__name__)
 
 DB_URL = f"postgresql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
 
+# Maximum age (seconds) of a candidate's underlying snapshot before approval is rejected.
+APPROVAL_STALENESS_LIMIT_SECONDS = 1200  # 20 minutes
+
 app = FastAPI(title="Spark Agent — Approval API", version="2.0.0")
 app.add_middleware(
     CORSMiddleware,
@@ -174,11 +177,38 @@ def get_candidate(candidate_id: int):
 def approve_candidate(candidate_id: int, body: ApproveRequest = ApproveRequest()):
     engine = get_engine()
     with engine.begin() as conn:
-        row = conn.execute(text(
-            "SELECT id, llm_card FROM trade_candidates WHERE id = :id"
-        ), {"id": candidate_id}).fetchone()
+        row = conn.execute(text("""
+            SELECT tc.id, tc.llm_card, tc.created_at,
+                   sr.ts AS snapshot_ts
+            FROM trade_candidates tc
+            LEFT JOIN snapshot_runs sr ON sr.id = tc.snapshot_id
+            WHERE tc.id = :id
+        """), {"id": candidate_id}).fetchone()
         if not row:
             raise HTTPException(status_code=404, detail="Candidate not found")
+
+        # ── Freshness gate ────────────────────────────────────────────────────
+        # Priority 1: snapshot_ts — the exact snapshot_run this candidate was
+        #   built from (strongest guarantee of data recency).
+        # Priority 2: candidate's own created_at — used when snapshot_id is NULL.
+        # Fail closed if neither is resolvable.
+        freshness_ts = row.snapshot_ts or row.created_at
+        if freshness_ts is None:
+            raise HTTPException(
+                status_code=422,
+                detail="Cannot verify candidate freshness — no snapshot timestamp found. Refusing to approve.",
+            )
+        if freshness_ts.tzinfo is None:
+            freshness_ts = freshness_ts.replace(tzinfo=timezone.utc)
+        age_seconds = (datetime.now(timezone.utc) - freshness_ts).total_seconds()
+        if age_seconds > APPROVAL_STALENESS_LIMIT_SECONDS:
+            age_min = int(age_seconds / 60)
+            raise HTTPException(
+                status_code=422,
+                detail=f"Candidate data is stale ({age_min} min old). Refresh data and regenerate before approving.",
+            )
+        # ── End freshness gate ────────────────────────────────────────────────
+
         card = _parse_jsonb(row.llm_card)
         card["approval_status"] = "approved"
         card["approval_ts"]     = datetime.now(timezone.utc).isoformat()
@@ -548,7 +578,6 @@ def get_health():
     try:
         token_path = PROJECT_ROOT / "token.json"
         if token_path.exists():
-            health["token"] = "present"
             token = json.loads(token_path.read_text())
             expires_at = token.get("expires_at") or token.get("expiry")
             if expires_at:
@@ -559,6 +588,9 @@ def get_health():
                     "days_remaining": round(days_left, 1),
                     "expires_at": exp_dt.isoformat(),
                 }
+            else:
+                # Token file exists but has no expiry field — auth may still work
+                health["token"] = "no_expiry_date"
         else:
             health["token"] = "missing"
     except Exception as e:

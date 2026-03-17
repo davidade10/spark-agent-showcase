@@ -240,6 +240,9 @@ def main():
         minute="5,35",
         timezone=recon_tz,
         id="reconciler_market_hours",
+        max_instances=1,
+        coalesce=True,
+        replace_existing=True,
     )
     recon_scheduler.add_job(
         job_reconciler,
@@ -249,6 +252,9 @@ def main():
         minute="5",
         timezone=recon_tz,
         id="reconciler_eod",
+        max_instances=1,
+        coalesce=True,
+        replace_existing=True,
     )
     recon_scheduler.start()
     logger.info("Reconciler scheduler started (9:05–15:35 ET every 30 min + 16:05 ET EOD)")

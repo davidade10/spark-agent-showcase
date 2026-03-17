@@ -1,0 +1,17 @@
+{
+  "status": "healthy",
+  "checks": {
+    "database": "ok",
+    "circuit_breaker": {
+      "state": "closed",
+      "failures": 0,
+      "attempts": 19
+    },
+    "data_freshness": {
+      "last_snapshot_minutes_ago": 25.6,
+      "is_stale": true
+    },
+    "token": "no_expiry_date",
+    "reconciler_log": "ok (25s old)"
+  }
+}
