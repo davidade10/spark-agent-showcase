@@ -11,6 +11,8 @@ Five components:
   5. run_collection_cycle() — main loop across watchlist
 """
 
+import ast
+import json
 import time
 import random
 import logging
@@ -32,11 +34,16 @@ DB_URL = f"postgresql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
 # Start small. Add symbols only after confirming clean collection for 5 days.
 # All symbols here must have liquid options (high ADV, tight spreads).
 WATCHLIST = [
-    "SPY",   # S&P 500 ETF     — highest options liquidity on earth
-    "QQQ",   # Nasdaq 100 ETF  — second highest
-    "IWM",   # Russell 2000    — good IV rank variance
-    "NVDA",  # High IV, liquid — good premium candidate
+    "IWM",   # Russell 2000        — good IV rank variance
+    "NVDA",  # High IV, liquid     — good premium candidate
     "AAPL",  # Defensive, liquid
+    "VOO",   # S&P 500 ETF         — equity positions
+    "BAC",   # Bank of America     — equity positions
+    "GOOG",  # Alphabet            — large-cap, liquid options
+    "SMCI",  # Super Micro Computer — high IV, covered-call position
+    "SMH",   # VanEck Semis ETF    — high IV, liquid
+    "SOXX",  # iShares Semis ETF   — high IV, liquid
+    "UNH",   # UnitedHealth        — defensive, high premium
 ]
 
 # Minimum strikes expected in a healthy chain response for liquid underlyings.
@@ -180,6 +187,93 @@ def validate_chain(chain: dict, symbol: str) -> str:
         return "failed"
 
 
+# ── Required contracts from open positions ───────────────────────────────────
+def _load_required_contracts(conn) -> set[tuple[str, str, str, float]]:
+    """
+    Load (symbol, expiry, option_right, strike) tuples for all option contracts
+    referenced by open positions. Used to force-include these in option_quotes
+    even when outside the normal DTE window.
+    """
+    required: set[tuple[str, str, str, float]] = set()
+    try:
+        rows = conn.execute(text("""
+            SELECT symbol, expiry, strategy,
+                   long_put_strike, short_put_strike,
+                   short_call_strike, long_call_strike,
+                   legs_json
+            FROM positions
+            WHERE status = 'open'
+              AND strategy IN (
+                'IRON_CONDOR', 'SHORT_OPTION', 'LONG_OPTION',
+                'VERTICAL_SPREAD', 'STRADDLE', 'STRANGLE'
+              )
+        """)).fetchall()
+    except Exception as e:
+        logger.warning(f"collector: could not load required contracts — {e}")
+        return required
+
+    for row in rows:
+        sym = str(row[0]) if row[0] else None
+        exp = str(row[1])[:10] if row[1] else None
+        strategy = (row[2] or "").upper()
+        lp, sp, sc, lc = row[3], row[4], row[5], row[6]
+        legs_raw = row[7] if len(row) > 7 else None
+
+        if not sym:
+            continue
+
+        def _add(side: str, strike_val, expiry_val: str | None) -> None:
+            if strike_val is not None and expiry_val:
+                try:
+                    s = round(float(strike_val), 4)
+                    required.add((sym, expiry_val, side, s))
+                except (TypeError, ValueError):
+                    pass
+
+        # Parse legs_json for single-leg and multi-leg strategies
+        legs: list = []
+        if legs_raw is not None:
+            if isinstance(legs_raw, list):
+                legs = legs_raw
+            elif isinstance(legs_raw, dict):
+                legs = [legs_raw]
+            elif isinstance(legs_raw, str) and legs_raw.strip():
+                try:
+                    parsed = json.loads(legs_raw)
+                except (json.JSONDecodeError, ValueError, TypeError):
+                    try:
+                        parsed = ast.literal_eval(legs_raw)
+                    except (ValueError, SyntaxError, TypeError):
+                        parsed = None
+                if isinstance(parsed, list):
+                    legs = parsed
+                elif isinstance(parsed, dict):
+                    legs = [parsed]
+
+        for leg in legs:
+            if isinstance(leg, dict):
+                strike = leg.get("strike")
+                right = leg.get("option_type") or leg.get("right")
+                leg_exp = leg.get("expiry")
+                if strike is not None and right:
+                    exp_val = str(leg_exp)[:10] if leg_exp else exp
+                    if exp_val:
+                        _add(str(right).upper()[:1] or "P", strike, exp_val)
+
+        # IRON_CONDOR: use strike columns when legs_json doesn't cover
+        if strategy == "IRON_CONDOR" and exp:
+            if lp is not None:
+                _add("P", lp, exp)
+            if sp is not None:
+                _add("P", sp, exp)
+            if sc is not None:
+                _add("C", sc, exp)
+            if lc is not None:
+                _add("C", lc, exp)
+
+    return required
+
+
 # ── Component 4: Database Writer ─────────────────────────────────────────────
 def write_chain_to_db(
     conn,
@@ -187,6 +281,7 @@ def write_chain_to_db(
     symbol: str,
     chain: dict,
     collected_at: datetime,
+    required_contracts: set[tuple[str, str, str, float]] | None = None,
 ) -> int:
     """
     Writes one full options chain snapshot to the database.
@@ -236,9 +331,9 @@ def write_chain_to_db(
                 logger.warning(f"{symbol}: could not parse expiry key '{exp_key}'")
                 continue
 
-            # Only write contracts within our target DTE window
-            if dte < HARD_RULES["min_dte"] or dte > HARD_RULES["max_dte"]:
-                continue
+            # Force-include contracts required by open positions; otherwise DTE window
+            rc = required_contracts or set()
+            in_window = HARD_RULES["min_dte"] <= dte <= HARD_RULES["max_dte"]
 
             for strike_str, contracts in strikes.items():
                 if not contracts:
@@ -259,6 +354,11 @@ def write_chain_to_db(
                 try:
                     strike = float(strike_str)
                 except ValueError:
+                    continue
+
+                strike_rounded = round(strike, 4)
+                is_required = (symbol, expiry_str, side, strike_rounded) in rc
+                if not in_window and not is_required:
                     continue
 
                 conn.execute(text("""
@@ -325,6 +425,37 @@ def run_collection_cycle(client) -> dict:
 
     with engine.connect() as conn:
 
+        # Derive dynamic symbol universe:
+        #   base WATCHLIST
+        #   ∪ all symbols with open non-equity option positions in positions table.
+        extra_symbols: list[str] = []
+        try:
+            rows = conn.execute(text("""
+                SELECT DISTINCT symbol
+                FROM positions
+                WHERE status = 'open'
+                  AND strategy IN (
+                    'IRON_CONDOR',
+                    'SHORT_OPTION',
+                    'LONG_OPTION',
+                    'VERTICAL_SPREAD',
+                    'STRADDLE',
+                    'STRANGLE'
+                  )
+            """)).fetchall()
+            extra_symbols = [str(r[0]) for r in rows if r[0]]
+        except Exception as e:
+            logger.warning(f"collector: could not load open-position symbols — {e}")
+
+        # Ensure we keep the explicit watchlist ordering; open-position symbols
+        # are appended and de-duplicated while preserving WATCHLIST order.
+        symbols: list[str] = []
+        seen: set[str] = set()
+        for sym in WATCHLIST + extra_symbols:
+            if sym not in seen:
+                seen.add(sym)
+                symbols.append(sym)
+
         # Create the snapshot_runs anchor row
         result = conn.execute(text("""
             INSERT INTO snapshot_runs (provider, status, meta)
@@ -332,18 +463,26 @@ def run_collection_cycle(client) -> dict:
             RETURNING id
         """), {
             "meta": f'{{"started_at": "{collected_at.isoformat()}", '
-                    f'"symbols_attempted": {len(WATCHLIST)}}}',
+                    f'"symbols_attempted": {len(symbols)}}}',
         })
         snapshot_id = result.scalar()
         conn.commit()
 
+        required_contracts = _load_required_contracts(conn)
+        if required_contracts:
+            logger.info(
+                f"Snapshot {snapshot_id}: force-including {len(required_contracts)} "
+                "required contracts from open positions"
+            )
+
         logger.info(
             f"Snapshot {snapshot_id} started — "
-            f"collecting {len(WATCHLIST)} symbols"
+            f"collecting {len(symbols)} symbols "
+            f"(base_watchlist={len(WATCHLIST)}, from_open_positions={len(extra_symbols)})"
         )
 
-        # Loop through watchlist
-        for symbol in WATCHLIST:
+        # Loop through effective symbol universe (watchlist ∪ open-position symbols)
+        for symbol in symbols:
             try:
                 # Step 1: Fetch
                 chain = pull_chain_with_retry(client, symbol)
@@ -358,7 +497,8 @@ def run_collection_cycle(client) -> dict:
 
                 # Step 3: Write
                 n = write_chain_to_db(
-                    conn, snapshot_id, symbol, chain, collected_at
+                    conn, snapshot_id, symbol, chain, collected_at,
+                    required_contracts=required_contracts,
                 )
                 conn.commit()
                 total_contracts += n

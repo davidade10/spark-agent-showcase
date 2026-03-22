@@ -29,6 +29,8 @@ mark sign convention matches fill_credit:
 """
 from __future__ import annotations
 
+import ast
+import json
 import logging
 from datetime import datetime, timezone
 from typing import Optional
@@ -55,9 +57,10 @@ def compute_position_marks(engine) -> dict[int, Optional[float]]:
 
     Mark sign convention (matches fill_credit — positive = premium received):
       IRON_CONDOR  → short_put_mid + short_call_mid − long_put_mid − long_call_mid
-      SHORT_OPTION → short_leg_mid
+      SHORT_OPTION → short_leg_mid (bid+ask)/2 from option_quotes
       LONG_OPTION  → long_leg_mid
-      Others       → None (EQUITY has no option mark)
+      EQUITY       → price from underlying_quotes
+      Others       → None
     """
     with engine.connect() as conn:
         # Latest completed snapshot
@@ -71,11 +74,12 @@ def compute_position_marks(engine) -> dict[int, Optional[float]]:
             return {}
         snapshot_id = snap_row[0]
 
-        # All open positions with their strike columns
+        # All open positions with their strike columns and legs_json
         pos_rows = conn.execute(text("""
             SELECT id, symbol, expiry, strategy,
                    long_put_strike, short_put_strike,
-                   short_call_strike, long_call_strike
+                   short_call_strike, long_call_strike,
+                   legs_json
             FROM positions
             WHERE status = 'open'
         """)).fetchall()
@@ -105,6 +109,17 @@ def compute_position_marks(engine) -> dict[int, Optional[float]]:
             key = (sym, str(exp_text)[:10], right, round(float(strike), 4))
             quote_map[key] = mid
 
+        # Batch-fetch underlying_quotes for EQUITY positions (price = mark)
+        underlying_rows = conn.execute(text("""
+            SELECT symbol, price
+            FROM underlying_quotes
+            WHERE snapshot_id = :sid
+              AND symbol = ANY(:symbols)
+              AND price IS NOT NULL
+              AND price > 0
+        """), {"sid": snapshot_id, "symbols": symbols}).fetchall()
+        underlying_map: dict[str, float] = {r[0]: float(r[1]) for r in underlying_rows}
+
     # Compute mark per position
     marks: dict[int, Optional[float]] = {}
     for row in pos_rows:
@@ -116,6 +131,11 @@ def compute_position_marks(engine) -> dict[int, Optional[float]]:
         sp  = round(float(row[5]), 4) if row[5] is not None else None
         sc  = round(float(row[6]), 4) if row[6] is not None else None
         lc  = round(float(row[7]), 4) if row[7] is not None else None
+
+        if strategy == "EQUITY":
+            price = underlying_map.get(sym)
+            marks[pos_id] = round(price, 4) if price is not None else None
+            continue
 
         if not exp:
             marks[pos_id] = None
@@ -139,13 +159,81 @@ def compute_position_marks(engine) -> dict[int, Optional[float]]:
                 marks[pos_id] = round(sp_mid + sc_mid - lp_mid - lc_mid, 4)
 
         elif strategy == "SHORT_OPTION":
-            strike = sc if sc is not None else sp
-            right  = "C" if sc is not None else "P"
+            # Single-leg: strike/right come from legs_json; condor columns are None
+            legs_raw = row[8] if len(row) > 8 else None
+            strike, right, leg_exp = None, None, None
+            leg_parsed: dict | None = None
+            legs: list = []
+            if legs_raw is not None:
+                if isinstance(legs_raw, list):
+                    legs = legs_raw
+                elif isinstance(legs_raw, dict):
+                    legs = [legs_raw]
+                elif isinstance(legs_raw, str) and legs_raw.strip():
+                    try:
+                        parsed = json.loads(legs_raw)
+                    except (json.JSONDecodeError, ValueError, TypeError):
+                        try:
+                            parsed = ast.literal_eval(legs_raw)
+                        except (ValueError, SyntaxError, TypeError):
+                            parsed = None
+                    if isinstance(parsed, list):
+                        legs = parsed
+                    elif isinstance(parsed, dict):
+                        legs = [parsed]
+            if legs:
+                leg = legs[0]
+                leg_parsed = dict(leg) if isinstance(leg, dict) else None
+                if leg_parsed:
+                    strike = leg_parsed.get("strike")
+                    right = leg_parsed.get("option_type") or leg_parsed.get("right")
+                    leg_exp = leg_parsed.get("expiry")
+            if strike is None or right is None:
+                strike = sc if sc is not None else sp
+                right = "C" if sc is not None else "P"
             if strike is None:
+                symbol_keys = [k for k in quote_map if k[0] == sym]
+                logger.warning(
+                    "[SHORT-OPTION-LOOKUP-MISS] symbol=%s pos_id=%s "
+                    "legs_json=%r leg_parsed=%s option_right=%s expiry=%s strike=%s "
+                    "lookup_key=N/A (strike/right missing) "
+                    "symbol_in_quote_map=%s sample_keys=%s",
+                    sym,
+                    pos_id,
+                    legs_raw,
+                    leg_parsed,
+                    right,
+                    (str(leg_exp)[:10] if leg_exp else exp) or exp,
+                    strike,
+                    sym in {k[0] for k in quote_map},
+                    symbol_keys[:3] if symbol_keys else [],
+                )
                 marks[pos_id] = None
             else:
-                mid = quote_map.get((sym, exp, right, strike))
-                marks[pos_id] = round(mid, 4) if mid is not None else None
+                exp_key = (str(leg_exp)[:10] if leg_exp else exp) or exp
+                strike_rounded = round(float(strike), 4)
+                lookup_key = (sym, exp_key, right, strike_rounded)
+                mid = quote_map.get(lookup_key)
+                if mid is None:
+                    symbol_keys = [k for k in quote_map if k[0] == sym]
+                    logger.warning(
+                        "[SHORT-OPTION-LOOKUP-MISS] symbol=%s pos_id=%s "
+                        "legs_json=%r leg_parsed=%s option_right=%s expiry=%s strike=%s "
+                        "lookup_key=%s symbol_in_quote_map=%s sample_keys=%s",
+                        sym,
+                        pos_id,
+                        legs_raw,
+                        leg_parsed,
+                        right,
+                        exp_key,
+                        strike_rounded,
+                        lookup_key,
+                        sym in {k[0] for k in quote_map},
+                        symbol_keys[:3] if symbol_keys else [],
+                    )
+                    marks[pos_id] = None
+                else:
+                    marks[pos_id] = round(mid, 4)
 
         elif strategy == "LONG_OPTION":
             strike = lc if lc is not None else lp
@@ -157,7 +245,7 @@ def compute_position_marks(engine) -> dict[int, Optional[float]]:
                 marks[pos_id] = round(mid, 4) if mid is not None else None
 
         else:
-            # EQUITY, STRANGLE, STRADDLE, VERTICAL_SPREAD, UNKNOWN — no single mark
+            # STRANGLE, STRADDLE, VERTICAL_SPREAD, UNKNOWN — no single mark
             marks[pos_id] = None
 
     return marks
@@ -173,6 +261,10 @@ _SEVERITY: dict[str, str] = {
     "TIME_EXIT_WARN":     "info",
     "TIME_EXIT_CRITICAL": "warning",
     "GAMMA_RISK":         "critical",
+    # Conditional DTE exit reasons (exit_mode = "conditional_dte")
+    "DTE_PROFIT_CAPTURE": "recommend",
+    "DTE_LOSS_LIMIT":     "urgent",
+    "DTE_REVIEW":         "info",
 }
 
 _MESSAGE: dict[str, str] = {
@@ -183,6 +275,10 @@ _MESSAGE: dict[str, str] = {
     "TIME_EXIT_WARN":     "Time decay concern — monitor closely",
     "TIME_EXIT_CRITICAL": "Expiration week — close or roll unless near max profit",
     "GAMMA_RISK":         "CRITICAL: gamma risk escalation at 7 DTE",
+    # Conditional DTE exit reasons
+    "DTE_PROFIT_CAPTURE": "DTE threshold reached with profit — capture gains",
+    "DTE_LOSS_LIMIT":     "DTE threshold reached at loss — limit further damage",
+    "DTE_REVIEW":         "DTE threshold reached — review position, hold band applies",
 }
 
 
@@ -213,13 +309,86 @@ def _is_still_triggered(
     reason: str, mark: float, fill_credit: float, dte: Optional[int], pnl_pct: float
 ) -> bool:
     """True if the trigger condition for *reason* still applies at current mark."""
+    # DTE conditional exit signals are not re-evaluated against a live condition —
+    # once generated they remain until the operator acknowledges or closes the position.
+    if reason in ("DTE_PROFIT_CAPTURE", "DTE_LOSS_LIMIT", "DTE_REVIEW"):
+        return True
     triggered = _eval_triggers(mark, fill_credit, dte, pnl_pct)
     return reason in triggered
 
 
+# ── Conditional DTE exit helpers ─────────────────────────────────────────────
+
+def _load_exit_config(conn) -> dict:
+    """
+    Load DTE exit configuration keys from agent_config table.
+    Returns a dict with all relevant keys, falling back to safe defaults.
+    """
+    defaults: dict = {
+        "exit_mode":                     "standard",
+        "exit_dte_threshold":            21,
+        "exit_dte_profit_close_pct":     15.0,
+        "exit_dte_loss_close_pct":       150.0,
+        "exit_dte_require_buying_power": True,
+        "profit_target_min_dollars":     0.0,
+        "profit_target_pct":             50.0,
+    }
+    keys = list(defaults.keys())
+    try:
+        rows = conn.execute(text("""
+            SELECT key, value FROM agent_config
+            WHERE key = ANY(:keys)
+        """), {"keys": keys}).fetchall()
+    except Exception as e:
+        logger.warning(f"exit_monitor._load_exit_config: could not read agent_config: {e}")
+        return defaults
+    config = dict(defaults)
+    for key, value in rows:
+        if key not in defaults:
+            continue
+        default_val = defaults[key]
+        try:
+            if isinstance(default_val, bool):
+                config[key] = str(value).lower() in ("true", "1", "yes")
+            elif isinstance(default_val, int):
+                config[key] = int(value)
+            elif isinstance(default_val, float):
+                config[key] = float(value)
+            else:
+                config[key] = str(value)
+        except (ValueError, TypeError):
+            pass  # keep default
+    return config
+
+
+def _eval_dte_exit(
+    pnl_pct: float, pnl_dollars: float, dte: Optional[int], config: dict
+) -> Optional[str]:
+    """
+    Evaluate conditional DTE exit. Returns a reason code or None.
+    Called only when exit_mode == "conditional_dte" and dte <= exit_dte_threshold.
+
+    Policy:
+      pnl_pct >= +profit_close_pct AND buying_power_available → DTE_PROFIT_CAPTURE
+      pnl_pct <= -loss_close_pct                              → DTE_LOSS_LIMIT
+      otherwise                                               → DTE_REVIEW
+    """
+    if dte is None:
+        return None
+    profit_close_pct = float(config.get("exit_dte_profit_close_pct", 15.0))
+    loss_close_pct   = float(config.get("exit_dte_loss_close_pct", 150.0))
+    # TODO: wire real buying-power check (requires account balance API integration)
+    buying_power_available = True
+    if pnl_pct >= profit_close_pct and buying_power_available:
+        return "DTE_PROFIT_CAPTURE"
+    if pnl_pct <= -loss_close_pct:
+        return "DTE_LOSS_LIMIT"
+    return "DTE_REVIEW"
+
+
 # ── Core scan ─────────────────────────────────────────────────────────────────
 
-def run_exit_scan(engine=None) -> list[dict]:
+def run_exit_scan(engine=None, pricing_only: bool = False) -> list[dict]:
     """
     Main entry point — scan all open positions and generate exit signals.
 
@@ -241,12 +410,58 @@ def run_exit_scan(engine=None) -> list[dict]:
         f"of {len(marks)} open positions"
     )
 
+    now = datetime.now(timezone.utc)
+
+    # Pricing-only path: update marks/unrealized_pnl on positions but do not
+    # touch exit_signals (no new signals from potentially stale data).
+    if pricing_only:
+        with engine.begin() as conn:
+            pos_rows = conn.execute(text("""
+                SELECT id, symbol, strategy, fill_credit, quantity
+                FROM positions
+                WHERE status = 'open'
+            """)).fetchall()
+
+            for row in pos_rows:
+                pos_id      = row[0]
+                symbol      = row[1]
+                strategy    = (row[2] or "IRON_CONDOR").upper()
+                fill_credit = float(row[3]) if row[3] is not None else None
+                quantity    = int(row[4]) if row[4] is not None else 1
+
+                mark = marks.get(pos_id)
+
+                pnl_dollars = None
+                if mark is not None and fill_credit is not None:
+                    if strategy == "EQUITY":
+                        pnl_dollars = (mark - fill_credit) * quantity
+                    else:
+                        if fill_credit > 0:
+                            pnl_dollars = (fill_credit - mark) * quantity * 100.0
+
+                if mark is not None:
+                    conn.execute(text("""
+                        UPDATE positions
+                        SET mark = :mark,
+                            mark_updated_at = :now,
+                            unrealized_pnl  = :unrealized_pnl
+                        WHERE id = :id
+                    """), {
+                        "mark":           mark,
+                        "now":            now,
+                        "unrealized_pnl": pnl_dollars,
+                        "id":             pos_id,
+                    })
+        logger.info("exit_monitor: pricing-only refresh complete (no signals generated)")
+        return []
+
+    # Full exit-monitor behavior (during market hours)
     dismiss_expired_signals(engine)
     clear_stale_signals(engine, marks)
 
-    now = datetime.now(timezone.utc)
     new_signals: list[dict] = []
 
+    # Transaction 1: persist marks first. If signal inserts fail later, marks stay.
     with engine.begin() as conn:
         pos_rows = conn.execute(text("""
             SELECT id, account_id, symbol, expiry, strategy, dte,
@@ -258,20 +473,51 @@ def run_exit_scan(engine=None) -> list[dict]:
         for row in pos_rows:
             pos_id      = row[0]
             symbol      = row[2]
+            strategy    = (row[4] or "IRON_CONDOR").upper()
+            fill_credit = float(row[6]) if row[6] is not None else None
+            quantity    = int(row[7]) if row[7] is not None else 1
+            mark        = marks.get(pos_id)
+
+            pnl_dollars = None
+            if mark is not None and fill_credit is not None:
+                if strategy == "EQUITY":
+                    pnl_dollars = (mark - fill_credit) * quantity
+                elif fill_credit > 0:
+                    pnl_dollars = (fill_credit - mark) * quantity * 100.0
+
+            if mark is not None:
+                conn.execute(text("""
+                    UPDATE positions
+                    SET mark = :mark,
+                        mark_updated_at = :now,
+                        unrealized_pnl  = :unrealized_pnl
+                    WHERE id = :id
+                """), {
+                    "mark":           mark,
+                    "now":            now,
+                    "unrealized_pnl": pnl_dollars,
+                    "id":             pos_id,
+                })
+
+    # Transaction 2: insert signals. Failed inserts are isolated via savepoint.
+    with engine.begin() as conn:
+        dte_config = _load_exit_config(conn)
+
+        for row in pos_rows:
+            pos_id      = row[0]
+            account_id  = row[1] or "PAPER"
+            symbol      = row[2]
             expiry      = row[3]
+            strategy    = (row[4] or "IRON_CONDOR").upper()
             dte         = row[5]
             fill_credit = float(row[6]) if row[6] is not None else None
             quantity    = int(row[7]) if row[7] is not None else 1
 
             mark = marks.get(pos_id)
 
-            # Always update mark on the position row if we have one
-            if mark is not None:
-                conn.execute(text("""
-                    UPDATE positions
-                    SET mark = :mark, mark_updated_at = :now
-                    WHERE id = :id
-                """), {"mark": mark, "now": now, "id": pos_id})
+            # Hotfix: skip condor-style exit triggers for EQUITY and SHORT_OPTION.
+            if strategy in ("EQUITY", "SHORT_OPTION"):
+                continue
 
             if mark is None:
                 logger.debug(
@@ -289,7 +535,6 @@ def run_exit_scan(engine=None) -> list[dict]:
             pnl_dollars = (fill_credit - mark) * quantity * 100.0
 
             for reason in _eval_triggers(mark, fill_credit, dte, pnl_pct):
-                # Dedupe: skip if same position + reason is already active
                 existing = conn.execute(text("""
                     SELECT 1 FROM exit_signals
                     WHERE position_id = :pid
@@ -303,51 +548,144 @@ def run_exit_scan(engine=None) -> list[dict]:
                 if existing:
                     continue
 
-                result = conn.execute(text("""
-                    INSERT INTO exit_signals (
-                        position_id, symbol, expiry, dte,
-                        reason, severity, message,
-                        pnl_pct, pnl_dollars,
-                        credit_received, debit_to_close, mark,
-                        status, created_at, updated_at
-                    ) VALUES (
-                        :position_id, :symbol, :expiry, :dte,
-                        :reason, :severity, :message,
-                        :pnl_pct, :pnl_dollars,
-                        :credit_received, :debit_to_close, :mark,
-                        'pending', :now, :now
+                savepoint = conn.begin_nested()
+                try:
+                    result = conn.execute(text("""
+                        INSERT INTO exit_signals (
+                            position_id, account_id, symbol, expiry, dte,
+                            reason, severity, message,
+                            pnl_pct, pnl_dollars,
+                            credit_received, debit_to_close, mark,
+                            status, created_at, updated_at
+                        ) VALUES (
+                            :position_id, :account_id, :symbol, :expiry, :dte,
+                            :reason, :severity, :message,
+                            :pnl_pct, :pnl_dollars,
+                            :credit_received, :debit_to_close, :mark,
+                            'pending', :now, :now
+                        )
+                        ON CONFLICT (position_id, reason) WHERE status = 'pending' DO NOTHING
+                        RETURNING id
+                    """), {
+                        "position_id":     pos_id,
+                        "account_id":      account_id,
+                        "symbol":          symbol,
+                        "expiry":          expiry,
+                        "dte":             dte,
+                        "reason":          reason,
+                        "severity":        _SEVERITY[reason],
+                        "message":         _MESSAGE[reason],
+                        "pnl_pct":         round(pnl_pct, 2),
+                        "pnl_dollars":     round(pnl_dollars, 2),
+                        "credit_received": fill_credit,
+                        "debit_to_close":  round(mark, 4),
+                        "mark":            round(mark, 4),
+                        "now":             now,
+                    })
+                    savepoint.commit()
+                    row = result.fetchone()
+                    if not row:
+                        continue
+                    new_id = row[0]
+                    new_signals.append({
+                        "id":          new_id,
+                        "position_id": pos_id,
+                        "symbol":      symbol,
+                        "reason":      reason,
+                        "severity":    _SEVERITY[reason],
+                        "pnl_pct":     round(pnl_pct, 2),
+                    })
+                    logger.info(
+                        f"exit_monitor: signal id={new_id} "
+                        f"{symbol} reason={reason} severity={_SEVERITY[reason]} "
+                        f"mark={mark:.4f} fill_credit={fill_credit:.4f} "
+                        f"pnl_pct={pnl_pct:.1f}% dte={dte}"
                     )
-                    RETURNING id
-                """), {
-                    "position_id":   pos_id,
-                    "symbol":        symbol,
-                    "expiry":        expiry,
-                    "dte":           dte,
-                    "reason":        reason,
-                    "severity":      _SEVERITY[reason],
-                    "message":       _MESSAGE[reason],
-                    "pnl_pct":       round(pnl_pct, 2),
-                    "pnl_dollars":   round(pnl_dollars, 2),
-                    "credit_received": fill_credit,
-                    "debit_to_close":  round(mark, 4),
-                    "mark":            round(mark, 4),
-                    "now":             now,
-                })
-                new_id = result.fetchone()[0]
-                new_signals.append({
-                    "id":          new_id,
-                    "position_id": pos_id,
-                    "symbol":      symbol,
-                    "reason":      reason,
-                    "severity":    _SEVERITY[reason],
-                    "pnl_pct":     round(pnl_pct, 2),
-                })
-                logger.info(
-                    f"exit_monitor: signal id={new_id} "
-                    f"{symbol} reason={reason} severity={_SEVERITY[reason]} "
-                    f"mark={mark:.4f} fill_credit={fill_credit:.4f} "
-                    f"pnl_pct={pnl_pct:.1f}% dte={dte}"
-                )
+                except Exception as e:
+                    savepoint.rollback()
+                    logger.error(
+                        "[EXIT-SIGNAL-DB-ERROR] Failed to insert exit_signal for "
+                        f"position_id={pos_id} reason={reason}: {e}"
+                    )
+
+            # Conditional DTE exit — evaluated once when dte crosses threshold.
+            # Independent of the 7-rule trigger loop above.
+            if (
+                dte_config.get("exit_mode") == "conditional_dte"
+                and dte is not None
+                and dte <= int(dte_config.get("exit_dte_threshold", 21))
+            ):
+                dte_reason = _eval_dte_exit(pnl_pct, pnl_dollars, dte, dte_config)
+                if dte_reason:
+                    existing = conn.execute(text("""
+                        SELECT 1 FROM exit_signals
+                        WHERE position_id = :pid
+                          AND reason = :reason
+                          AND (
+                                status = 'pending'
+                             OR (status = 'snoozed' AND snoozed_until > NOW())
+                          )
+                        LIMIT 1
+                    """), {"pid": pos_id, "reason": dte_reason}).fetchone()
+                    if not existing:
+                        dte_savepoint = conn.begin_nested()
+                        try:
+                            dte_result = conn.execute(text("""
+                                INSERT INTO exit_signals (
+                                    position_id, account_id, symbol, expiry, dte,
+                                    reason, severity, message,
+                                    pnl_pct, pnl_dollars,
+                                    credit_received, debit_to_close, mark,
+                                    status, created_at, updated_at
+                                ) VALUES (
+                                    :position_id, :account_id, :symbol, :expiry, :dte,
+                                    :reason, :severity, :message,
+                                    :pnl_pct, :pnl_dollars,
+                                    :credit_received, :debit_to_close, :mark,
+                                    'pending', :now, :now
+                                )
+                                ON CONFLICT (position_id, reason) WHERE status = 'pending' DO NOTHING
+                                RETURNING id
+                            """), {
+                                "position_id":     pos_id,
+                                "account_id":      account_id,
+                                "symbol":          symbol,
+                                "expiry":          expiry,
+                                "dte":             dte,
+                                "reason":          dte_reason,
+                                "severity":        _SEVERITY[dte_reason],
+                                "message":         _MESSAGE[dte_reason],
+                                "pnl_pct":         round(pnl_pct, 2),
+                                "pnl_dollars":     round(pnl_dollars, 2),
+                                "credit_received": fill_credit,
+                                "debit_to_close":  round(mark, 4),
+                                "mark":            round(mark, 4),
+                                "now":             now,
+                            })
+                            dte_savepoint.commit()
+                            sig_row = dte_result.fetchone()
+                            if sig_row:
+                                new_id = sig_row[0]
+                                new_signals.append({
+                                    "id":          new_id,
+                                    "position_id": pos_id,
+                                    "symbol":      symbol,
+                                    "reason":      dte_reason,
+                                    "severity":    _SEVERITY[dte_reason],
+                                    "pnl_pct":     round(pnl_pct, 2),
+                                })
+                                logger.info(
+                                    f"exit_monitor: DTE signal id={new_id} "
+                                    f"{symbol} reason={dte_reason} "
+                                    f"severity={_SEVERITY[dte_reason]} "
+                                    f"pnl_pct={pnl_pct:.1f}% dte={dte}"
+                                )
+                        except Exception as e:
+                            dte_savepoint.rollback()
+                            logger.error(
+                                "[EXIT-SIGNAL-DB-ERROR] Failed to insert DTE exit_signal for "
+                                f"position_id={pos_id} reason={dte_reason}: {e}"
+                            )
 
     count = len(new_signals)
     if count:

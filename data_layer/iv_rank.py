@@ -9,11 +9,11 @@ in the option_quotes table, then computes the 252-snapshot rank.
 import logging
 from sqlalchemy import text, create_engine
 from config import DB_HOST, DB_PORT, DB_NAME, DB_USER, DB_PASSWORD
+from data_layer.collector import WATCHLIST
 
 logger = logging.getLogger(__name__)
 
 DB_URL = f"postgresql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
-WATCHLIST = ["SPY", "QQQ", "IWM", "NVDA", "AAPL"]
 
 _RANK_QUERY = text("""
     WITH snapshot_iv AS (
@@ -78,8 +78,20 @@ def compute_iv_rank(symbol: str, engine) -> float | None:
     return rank
 
 def run_iv_rank_computation(symbols: list[str] | None = None) -> dict[str, float | None]:
-    symbols = symbols or WATCHLIST
     engine = create_engine(DB_URL)
+    if symbols is None:
+        # Discover all symbols currently in underlying_quotes so that active
+        # symbols added via open-positions collection (not in the static
+        # WATCHLIST) also receive IV rank updates.
+        try:
+            with engine.connect() as conn:
+                rows = conn.execute(text(
+                    "SELECT DISTINCT symbol FROM underlying_quotes ORDER BY symbol"
+                )).fetchall()
+                symbols = [r[0] for r in rows] if rows else WATCHLIST
+        except Exception as exc:
+            logger.warning("run_iv_rank_computation: could not discover symbols — %s", exc)
+            symbols = WATCHLIST
     logger.info("Running IV rank computation for %d symbols", len(symbols))
 
     results = {}

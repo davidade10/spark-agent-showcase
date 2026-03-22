@@ -43,20 +43,24 @@ def build_context_block(symbol: str, account_id: Optional[str] = None, lookback_
             if account_id:
                 lines.append(f"Account focus: {account_id}")
 
-            # Open positions in same symbol
+            # Open positions in same symbol (all strategies — matches Positions tab)
             pos = conn.execute(text("""
-                SELECT account_id, position_key, expiry, dte, entry_credit,
-                       meta->>'debit_to_close' AS debit_to_close
+                SELECT account_id, position_key, strategy, expiry, dte,
+                       COALESCE(fill_credit, entry_credit) AS credit
                 FROM positions
-                WHERE status='open' AND strategy='iron_condor' AND symbol=:sym
-                ORDER BY dte ASC
+                WHERE status = 'open' AND symbol = :sym
+                ORDER BY dte ASC NULLS LAST
                 LIMIT 5
             """), {"sym": symbol}).fetchall()
 
             if pos:
                 lines.append("Open positions (same symbol):")
                 for r in pos:
-                    lines.append(f"- acct={r[0]} key={r[1]} exp={r[2]} dte={r[3]} credit={r[4]} dtc={r[5]}")
+                    strat = r[2] or "UNKNOWN"
+                    lines.append(
+                        f"- acct={r[0]} strategy={strat} key={r[1]} "
+                        f"exp={r[3]} dte={r[4]} credit={r[5]}"
+                    )
             else:
                 lines.append("Open positions (same symbol): none")
 

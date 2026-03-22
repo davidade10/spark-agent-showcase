@@ -72,6 +72,62 @@ body {
   font-family: Arial, Helvetica, sans-serif;
 }
 
+/* Numeric / tabular data — JetBrains Mono (loaded in layout.tsx) */
+.font-numeric {
+  font-family: var(--font-jetbrains-mono), ui-monospace, monospace;
+  font-variant-numeric: tabular-nums;
+}
+
+/* Compact iron condor strip — hierarchy: strikes brightest, labels softer, seps softest */
+.spread-condor-summary {
+  display: inline-flex;
+  flex-wrap: nowrap;
+  align-items: baseline;
+  max-width: 100%;
+  min-width: 0;
+  overflow-x: auto;
+  white-space: nowrap;
+  column-gap: 0.2em;
+  row-gap: 0.15rem;
+  scrollbar-width: thin;
+}
+.spread-condor-summary .condor-lab {
+  color: rgba(255, 255, 255, 0.38);
+  font-weight: 500;
+  letter-spacing: 0.02em;
+}
+.spread-condor-summary .condor-sep {
+  color: rgba(255, 255, 255, 0.16);
+  font-weight: 300;
+  padding: 0 0.1em;
+  user-select: none;
+}
+.spread-condor-summary .condor-str {
+  color: var(--text-primary);
+  font-weight: 600;
+}
+.spread-condor-summary .condor-meta {
+  color: var(--text-secondary);
+  font-weight: 500;
+  opacity: 0.95;
+}
+.spread-condor-summary .condor-tail {
+  display: inline-flex;
+  align-items: baseline;
+  column-gap: 0.2em;
+  padding-left: 0.55rem;
+  margin-left: 0.05rem;
+}
+
+/* History drawer — tighter metadata blocks */
+.history-meta-block {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 0.35rem 0.75rem;
+  line-height: 1.35;
+}
+
 /* ── Card surface treatment (Change 6) ─────────────────────────────────────── */
 /* Full surface: bg + border + shadow + gradient.                                */
 /* Use on account cards and position rows.                                       */

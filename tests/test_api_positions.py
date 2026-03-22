@@ -114,8 +114,10 @@ class TestGetPositions:
         assert p["entry_credit"] == pytest.approx(1.20)
 
     def test_profit_pct_computed_when_pnl_and_credit_present(self):
-        # profit_pct = unrealized_pnl / fill_credit * 100
-        engine = _make_engine([_base_row(fill_credit=0.80, unrealized_pnl=0.40)])
+        # profit_pct = unrealized_pnl / (fill_credit * qty * 100) * 100
+        # With fill_credit=0.80, qty=1, unrealized_pnl=40.0 dollars:
+        # total_entry = 0.80 * 1 * 100 = 80 → profit_pct = 40 / 80 * 100 = 50%
+        engine = _make_engine([_base_row(fill_credit=0.80, unrealized_pnl=40.0)])
         with patch("approval_ui.api.get_engine", return_value=engine), \
              patch("approval_ui.api.migrate_orders_schema"):
             with TestClient(app) as client:

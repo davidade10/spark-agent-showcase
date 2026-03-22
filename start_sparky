@@ -55,7 +55,7 @@ done
 echo "🚀 Booting Sparky Quant Desk..."
 
 echo "  Starting Backend API (port 8000)..."
-nohup uv run uvicorn approval_ui.api:app --reload --port 8000 \
+nohup uv run uvicorn approval_ui.api:app --reload --host 0.0.0.0 --port 8000 \
     >> "$LOG_DIR/backend.log" 2>&1 &
 
 echo "  Starting Frontend UI (port 3000)..."

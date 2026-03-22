@@ -23,7 +23,13 @@ import logging
 from dataclasses import dataclass
 from typing import Optional
 
-from strategy_engine.candidates import IronCondorCandidate
+from config import HARD_RULES
+from strategy_engine.candidates import IronCondorCandidate, StrangleCandidate
+
+try:
+    from data_layer.events_calendar import is_earnings_within_days as _is_earnings_within_days
+except Exception:
+    _is_earnings_within_days = None  # type: ignore[assignment]
 
 logger = logging.getLogger(__name__)
 
@@ -57,27 +63,33 @@ DTE_MAX_DEV    = 15    # this far outside sweet spot → zero score
 @dataclass
 class ScoredCandidate:
     """
-    Wraps an IronCondorCandidate with its score breakdown.
+    Wraps an IronCondorCandidate or StrangleCandidate with its score breakdown.
     This is what flows into rules_gate.py and the LLM layer.
 
-    The score breakdown is stored separately so every downstream
-    component can see exactly why a candidate ranked where it did.
-    This is the auditable record — you can always trace a trade
-    recommendation back to its specific score components.
+    For iron condors: 4 dimensions × 25 pts = 100 pts total.
+    For strangles:    5 dimensions, 100 pts total:
+      - iv_rank_score      → IV rank (30 pts, stepped curve 40/60/80 thresholds)
+      - credit_width_score → credit_pct = net_credit/underlying_price*100 (25 pts)
+      - dte_score          → DTE sweet spot 30–40, hard zero outside 21–50 (20 pts)
+      - delta_score        → delta symmetry: |abs(call_delta)−abs(put_delta)| (15 pts)
+      - call_delta_score   → event proximity penalty (10 pts, None for condors)
     """
-    candidate:          IronCondorCandidate
+    candidate:          IronCondorCandidate | StrangleCandidate
 
     # Total score (0–100)
     total_score:        float
 
-    # Component scores (each 0–25)
+    # Component scores
     iv_rank_score:      float
-    credit_width_score: float
-    delta_score:        float
+    credit_width_score: float    # condors: credit/width ratio; strangles: credit_pct (25 pts)
+    delta_score:        float    # condors: avg deviation; strangles: delta symmetry (15 pts)
     dte_score:          float
 
     # Human-readable explanation of each component
     score_notes:        list[str]
+
+    # Strangles only: event proximity score (10 pts). None for condors.
+    call_delta_score:   Optional[float] = None
 
     @property
     def symbol(self) -> str:
@@ -96,8 +108,8 @@ class ScoredCandidate:
         return self.candidate.net_credit
 
     @property
-    def max_loss(self) -> float:
-        return self.candidate.max_loss
+    def max_loss(self) -> Optional[float]:
+        return getattr(self.candidate, "max_loss", None)
 
     def summary_line(self) -> str:
         """One-line summary for logging and display."""
@@ -288,12 +300,168 @@ def _score_dte(dte: int) -> tuple[float, str]:
     return round(score, 2), note
 
 
+# ── Strangle scoring helpers ──────────────────────────────────────────────────
+# Weights: IV rank 30 + credit_pct 25 + DTE 20 + delta symmetry 15 + events 10 = 100
+
+
+def _score_strangle_iv_rank(iv_rank: Optional[float]) -> tuple[float, str]:
+    """
+    IV rank score for strangle (0–30 pts). Stepped curve:
+      < 40  → 0
+      40–60 → linear 0–20
+      60–80 → linear 20–30
+      ≥ 80  → 30
+    None (unknown history) → neutral 15 pts.
+    """
+    if iv_rank is None:
+        return 15.0, "IV rank N/A — neutral score (insufficient history)"
+    if iv_rank >= 80:
+        return 30.0, f"IV rank {iv_rank:.0f} ≥ 80 — full score (30 pts)"
+    if iv_rank >= 60:
+        score = 20.0 + (iv_rank - 60.0) / (80.0 - 60.0) * 10.0
+        return round(score, 2), f"IV rank {iv_rank:.0f} in 60–80 → {score:.1f}/30 pts"
+    if iv_rank >= 40:
+        score = (iv_rank - 40.0) / (60.0 - 40.0) * 20.0
+        return round(score, 2), f"IV rank {iv_rank:.0f} in 40–60 → {score:.1f}/30 pts"
+    return 0.0, f"IV rank {iv_rank:.0f} < 40 — zero score"
+
+
+def _score_strangle_credit_pct(
+    net_credit: float, underlying_price: float
+) -> tuple[float, str]:
+    """
+    Credit-as-pct-of-underlying score for strangle (0–25 pts).
+      credit_pct = net_credit / underlying_price * 100
+      < 0.8%  → 0
+      0.8–2.0 → linear 0–25
+      ≥ 2.0%  → 25
+    """
+    if underlying_price <= 0:
+        return 0.0, "Underlying price unavailable — zero score"
+    credit_pct = net_credit / underlying_price * 100.0
+    if credit_pct >= 2.0:
+        return 25.0, (
+            f"Credit pct {credit_pct:.2f}% ≥ 2.0% — full score (25 pts)"
+        )
+    if credit_pct < 0.8:
+        return 0.0, (
+            f"Credit pct {credit_pct:.2f}% < 0.8% — zero score"
+        )
+    score = (credit_pct - 0.8) / (2.0 - 0.8) * 25.0
+    return round(score, 2), (
+        f"Credit pct {credit_pct:.2f}% → {score:.1f}/25 pts"
+    )
+
+
+def _score_strangle_dte(dte: int) -> tuple[float, str]:
+    """
+    DTE score for strangle (0–20 pts).
+    Sweet spot 30–40; hard zero outside 21–50.
+      < 21 or > 50 → 0
+      21–30        → linear 0–20
+      30–40        → 20 (full)
+      40–50        → linear 20–0
+    """
+    if dte < 21 or dte > 50:
+        return 0.0, f"DTE={dte} outside 21–50 window — zero score"
+    if 30 <= dte <= 40:
+        return 20.0, f"DTE={dte} in sweet spot 30–40 — full score (20 pts)"
+    if dte < 30:
+        score = (dte - 21) / (30 - 21) * 20.0
+        return round(score, 2), f"DTE={dte} → {score:.1f}/20 pts (approaching sweet spot)"
+    # 40 < dte <= 50
+    score = (1.0 - (dte - 40) / (50 - 40)) * 20.0
+    return round(score, 2), f"DTE={dte} → {score:.1f}/20 pts (past sweet spot)"
+
+
+def _score_strangle_delta_symmetry(
+    short_call_delta: float, short_put_delta: float
+) -> tuple[float, str]:
+    """
+    Delta symmetry score for strangle (0–15 pts).
+    Measures how balanced both short legs are relative to each other.
+      asymmetry = |abs(short_call_delta) − abs(short_put_delta)|
+      ≤ 0.02 → 15 (perfectly balanced)
+      0.02–0.08 → linear 15–0
+      > 0.08 → 0
+    """
+    asymmetry = abs(abs(short_call_delta) - abs(short_put_delta))
+    if asymmetry <= 0.02:
+        return 15.0, (
+            f"Δsymmetry: asymmetry={asymmetry:.3f} ≤ 0.02 — full score (15 pts)"
+        )
+    if asymmetry > 0.08:
+        return 0.0, (
+            f"Δsymmetry: asymmetry={asymmetry:.3f} > 0.08 — zero score"
+        )
+    score = (1.0 - (asymmetry - 0.02) / (0.08 - 0.02)) * 15.0
+    return round(score, 2), (
+        f"Δsymmetry: asymmetry={asymmetry:.3f} → {score:.1f}/15 pts"
+    )
+
+
+def _score_strangle_events(symbol: str) -> tuple[float, str]:
+    """
+    Event proximity score for strangle (0–10 pts).
+    Penalizes earnings within 30 days.
+    Returns full 10 pts if event check fails (don't penalize on data absence).
+    """
+    if _is_earnings_within_days is None:
+        return 10.0, f"{symbol}: event check unavailable — full score (10 pts)"
+    try:
+        if _is_earnings_within_days(symbol, 30):
+            return 0.0, f"{symbol}: earnings within 30 days — zero score"
+    except Exception as e:
+        logger.debug(f"_score_strangle_events: check failed for {symbol} — {e}")
+        return 10.0, f"{symbol}: event check error — full score (10 pts)"
+    return 10.0, f"{symbol}: no earnings within 30 days — full score (10 pts)"
+
+
+def score_strangle(candidate: StrangleCandidate) -> ScoredCandidate:
+    """
+    Scores a StrangleCandidate across five dimensions (100 pts total):
+      1. IV rank (30 pts)       — stepped curve with 40/60/80 thresholds
+      2. Credit pct (25 pts)    — net_credit / underlying_price * 100, floor 0.8%, ceil 2.0%
+      3. DTE (20 pts)           — sweet spot 30–40, hard zero outside 21–50
+      4. Delta symmetry (15 pts)— |abs(call_delta) − abs(put_delta)|, best at ≤ 0.02
+      5. Event proximity (10 pts)— earnings within 30 days → 0; none → 10
+
+    The `call_delta_score` field on ScoredCandidate carries the event proximity score
+    (10 pts) to keep the existing schema intact while conveying strangle-specific data.
+    """
+    iv_score,   iv_note   = _score_strangle_iv_rank(candidate.iv_rank)
+    cred_score, cred_note = _score_strangle_credit_pct(
+        candidate.net_credit, candidate.underlying_price
+    )
+    dte_score,  dte_note  = _score_strangle_dte(candidate.dte)
+    sym_score,  sym_note  = _score_strangle_delta_symmetry(
+        candidate.short_call_delta, candidate.short_put_delta
+    )
+    evt_score,  evt_note  = _score_strangle_events(candidate.symbol)
+
+    total = round(iv_score + cred_score + dte_score + sym_score + evt_score, 2)
+
+    return ScoredCandidate(
+        candidate          = candidate,
+        total_score        = total,
+        iv_rank_score      = iv_score,
+        credit_width_score = cred_score,
+        delta_score        = sym_score,
+        dte_score          = dte_score,
+        call_delta_score   = evt_score,   # event proximity (10 pts) — strangle-specific
+        score_notes        = [iv_note, cred_note, dte_note, sym_note, evt_note],
+    )
+
+
 # ── Main scorer ───────────────────────────────────────────────────────────────
-def score_candidate(candidate: IronCondorCandidate) -> ScoredCandidate:
+def score_candidate(candidate: IronCondorCandidate | StrangleCandidate) -> ScoredCandidate:
     """
-    Scores a single IronCondorCandidate across all four dimensions.
-    Returns a ScoredCandidate with the full breakdown attached.
+    Scores a candidate. Dispatches to score_strangle() for StrangleCandidate;
+    uses the four-dimension condor scoring path for IronCondorCandidate.
     """
+    if isinstance(candidate, StrangleCandidate):
+        return score_strangle(candidate)
+
     iv_score,    iv_note    = _score_iv_rank(candidate.iv_rank)
     cw_score,    cw_note    = _score_credit_width(
                                   candidate.net_credit,
@@ -319,7 +487,7 @@ def score_candidate(candidate: IronCondorCandidate) -> ScoredCandidate:
 
 
 def score_candidates(
-    candidates: list[IronCondorCandidate],
+    candidates: list[IronCondorCandidate | StrangleCandidate],
 ) -> list[ScoredCandidate]:
     """
     Scores and ranks a list of candidates.

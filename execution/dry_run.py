@@ -14,6 +14,7 @@ Never called when TRADING_MODE=live.
 """
 from __future__ import annotations
 
+import json
 import logging
 from datetime import datetime, timezone
 from typing import Optional
@@ -125,6 +126,33 @@ def simulate_fill(candidate_json: dict, quantity: int, order_id: int) -> int:
                 f"falling back to stored net_credit={net_credit}"
             )
 
+        # Same positions.legs shape as data_layer.reconciler / strategy_engine (for dashboard LEG PRICES).
+        expiry_str = str(expiry).split("T")[0][:10] if expiry else ""
+        qty_signed = int(quantity)
+
+        def _paper_leg(
+            strike_key: str,
+            right: str,
+            signed: int,
+            mid: Optional[float],
+        ) -> dict:
+            return {
+                "schwab_symbol": None,
+                "expiry": expiry_str,
+                "right": right,
+                "strike": float(candidate_json[strike_key]),
+                "qty_signed": signed,
+                "avg_price": round(float(mid), 4) if mid is not None else None,
+                "market_value": None,
+            }
+
+        legs_struct = {
+            "short_put": _paper_leg("short_put_strike", "P", -qty_signed, short_put_mid),
+            "long_put": _paper_leg("long_put_strike", "P", qty_signed, long_put_mid),
+            "short_call": _paper_leg("short_call_strike", "C", -qty_signed, short_call_mid),
+            "long_call": _paper_leg("long_call_strike", "C", qty_signed, long_call_mid),
+        }
+
         # 3. Update orders row — status='filled'
         conn.execute(text("""
             UPDATE orders
@@ -151,6 +179,7 @@ def simulate_fill(candidate_json: dict, quantity: int, order_id: int) -> int:
                 long_call_strike,
                 quantity,
                 fill_credit,
+                legs,
                 opened_at,
                 status,
                 order_id
@@ -165,6 +194,7 @@ def simulate_fill(candidate_json: dict, quantity: int, order_id: int) -> int:
                 :long_call_strike,
                 :quantity,
                 :fill_credit,
+                CAST(:legs AS JSONB),
                 :opened_at,
                 'open',
                 :order_id
@@ -178,6 +208,7 @@ def simulate_fill(candidate_json: dict, quantity: int, order_id: int) -> int:
             "long_call_strike":  candidate_json["long_call_strike"],
             "quantity":          quantity,
             "fill_credit":       net_fill,
+            "legs":              json.dumps(legs_struct),
             "opened_at":         datetime.now(timezone.utc),
             "order_id":          order_id,
         })

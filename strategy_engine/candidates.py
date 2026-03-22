@@ -83,10 +83,57 @@ class IronCondorCandidate:
 
     # Context
     underlying_price: float
-    iv_rank:          Optional[float]   # None until 3 months of history
+    iv_rank:          Optional[float] = None  # None until 3 months of history
+
+    # Position size — condors (contracts per leg); scanner defaults to 1-lot proposals
+    qty:              int       = 1
 
     # Metadata
     scan_notes: list[str] = field(default_factory=list)
+
+
+@dataclass
+class StrangleCandidate:
+    """
+    One short strangle — sell OTM put and OTM call with no protective wings.
+    Credit = sum of both short legs' mid-prices.
+    Max loss is theoretically unlimited; excluded from position-risk gate checks.
+    Flows into score_strangle() → rules_gate strangle branch → approval UI.
+    """
+
+    # Strategy tag (always "STRANGLE")
+    strategy:           str
+
+    # Identity
+    symbol:             str
+    snapshot_id:        int
+    expiry:             str            # "2026-04-17"
+    dte:                int
+
+    # Two short legs — strikes only, no wings
+    short_put_strike:   float
+    short_call_strike:  float
+
+    # Greeks at short strikes
+    short_put_delta:    float          # negative (put), abs ~0.16
+    short_call_delta:   float          # positive (call), abs ~0.16
+
+    # Leg credits (mid-prices)
+    short_put_credit:   float
+    short_call_credit:  float
+
+    # Economics
+    net_credit:         float          # short_put_credit + short_call_credit
+
+    # Context
+    iv_rank:            Optional[float]
+    underlying_price:   float
+
+    # Position size
+    qty:                int            = 1
+
+    # Metadata / context notes
+    context_block:      list[str]      = field(default_factory=list)
 
 
 # ── Expiry helpers ────────────────────────────────────────────────────────────
@@ -126,6 +173,32 @@ def _get_underlying_price(conn, symbol: str, snapshot_id: int) -> Optional[float
     """), {"symbol": symbol, "snapshot_id": snapshot_id}).fetchone()
 
     return float(row.price) if row else None
+
+
+def _get_open_positions_by_symbol(conn) -> dict[str, list[str]]:
+    """
+    Returns symbol -> list of open strategy names.
+    Uses the same definition of 'open' as the Positions tab (status='open').
+    """
+    rows = conn.execute(text("""
+        SELECT symbol, UPPER(COALESCE(strategy, '')) AS strategy
+        FROM positions
+        WHERE status = 'open'
+          AND symbol IS NOT NULL
+          AND TRIM(symbol) != ''
+    """)).fetchall()
+
+    result: dict[str, list[str]] = {}
+    for r in rows:
+        sym = r.symbol.strip()
+        strat = (r.strategy or "").strip()
+        if not strat:
+            strat = "UNKNOWN"
+        if sym not in result:
+            result[sym] = []
+        if strat not in result[sym]:
+            result[sym].append(strat)
+    return result
 
 
 def _get_iv_rank(conn, symbol: str) -> Optional[float]:
@@ -277,6 +350,7 @@ def _build_candidate_for_expiry(
     contracts:        list[dict],
     underlying_price: float,
     iv_rank:          Optional[float],
+    existing_strategies: Optional[list[str]] = None,
 ) -> Optional[IronCondorCandidate]:
     """
     Attempts to build one IronCondorCandidate for a specific expiry.
@@ -359,6 +433,12 @@ def _build_candidate_for_expiry(
     if iv_rank is None:
         notes.append("IV rank not yet available (< 3 months history)")
 
+    if existing_strategies:
+        notes.append(
+            f"Existing open position(s) in {symbol}: "
+            f"{', '.join(sorted(existing_strategies))}"
+        )
+
     return IronCondorCandidate(
         symbol            = symbol,
         snapshot_id       = snapshot_id,
@@ -383,11 +463,174 @@ def _build_candidate_for_expiry(
     )
 
 
+# ── Strangle builder ──────────────────────────────────────────────────────────
+def _build_strangle_for_expiry(
+    symbol:              str,
+    snapshot_id:         int,
+    expiry:              str,
+    dte:                 int,
+    contracts:           list[dict],
+    underlying_price:    float,
+    iv_rank:             Optional[float],
+    min_credit:          float,
+    existing_strategies: Optional[list[str]] = None,
+) -> Optional[StrangleCandidate]:
+    """
+    Attempts to build one StrangleCandidate for a specific expiry.
+    Uses the same delta-targeting logic as iron condors (_find_short_put,
+    _find_short_call) — best delta match within the [0.10, 0.22] band.
+    Returns None if any required leg is missing or net credit is below minimum.
+    """
+    puts  = [c for c in contracts if c["option_right"] == "P"]
+    calls = [c for c in contracts if c["option_right"] == "C"]
+
+    if not puts or not calls:
+        logger.debug(f"{symbol} {expiry}: strangle — no puts or calls — skipping")
+        return None
+
+    short_put  = _find_short_put(puts)
+    short_call = _find_short_call(calls)
+
+    if not short_put or not short_call:
+        logger.debug(
+            f"{symbol} {expiry}: strangle — could not find short strikes "
+            f"near delta {TARGET_SHORT_DELTA}"
+        )
+        return None
+
+    short_put_credit  = _mid(short_put)
+    short_call_credit = _mid(short_call)
+    net_credit        = round(short_put_credit + short_call_credit, 4)
+
+    if net_credit < min_credit:
+        logger.debug(
+            f"{symbol} {expiry}: strangle net credit ${net_credit:.2f} "
+            f"below minimum ${min_credit:.2f} — skipping"
+        )
+        return None
+
+    notes = []
+    if iv_rank is None:
+        notes.append("IV rank not yet available (< 3 months history)")
+    if existing_strategies:
+        notes.append(
+            f"Existing open position(s) in {symbol}: "
+            f"{', '.join(sorted(existing_strategies))}"
+        )
+
+    return StrangleCandidate(
+        strategy          = "STRANGLE",
+        symbol            = symbol,
+        snapshot_id       = snapshot_id,
+        expiry            = str(expiry),
+        dte               = dte,
+        short_put_strike  = short_put["strike"],
+        short_call_strike = short_call["strike"],
+        short_put_delta   = round(short_put["delta"],  4),
+        short_call_delta  = round(short_call["delta"], 4),
+        short_put_credit  = short_put_credit,
+        short_call_credit = short_call_credit,
+        net_credit        = net_credit,
+        iv_rank           = iv_rank,
+        underlying_price  = underlying_price,
+        context_block     = notes,
+    )
+
+
+def generate_strangle_candidates(
+    conn,
+    symbols:        list[str],
+    snapshot_id:    int,
+    open_positions: dict[str, list[str]],
+) -> list[StrangleCandidate]:
+    """
+    Scans option_quotes for short strangle candidates across all symbols.
+
+    Strangle rules applied here (pre-gate):
+      - Symbol must not already have an open STRANGLE position
+      - IV rank must be >= strangle_min_iv_rank (HARD_RULES key, fallback 50)
+        — strangles carry unlimited risk; elevated IV is required
+      - Net credit must be >= strangle_min_credit (HARD_RULES key, fallback 1.50)
+      - One candidate per expiry per symbol — best delta match
+
+    Reuses the same DTE window and expiry-preference logic as condor generation.
+    """
+    try:
+        min_iv_rank = float(HARD_RULES["strangle_min_iv_rank"])
+    except (KeyError, TypeError, ValueError):
+        min_iv_rank = 50.0
+
+    try:
+        min_credit = float(HARD_RULES["strangle_min_credit"])
+    except (KeyError, TypeError, ValueError):
+        min_credit = 1.50
+
+    candidates: list[StrangleCandidate] = []
+
+    for symbol in symbols:
+        open_strategies = open_positions.get(symbol, [])
+
+        if "STRANGLE" in open_strategies:
+            logger.info(
+                f"{symbol}: skipping strangle scan — already has open STRANGLE position"
+            )
+            continue
+
+        iv_rank = _get_iv_rank(conn, symbol)
+
+        # IV rank gate: strangles require elevated IV to justify unlimited risk
+        if iv_rank is not None and iv_rank < min_iv_rank:
+            logger.debug(
+                f"{symbol}: strangle skipped — IV rank {iv_rank:.1f} "
+                f"below minimum {min_iv_rank:.1f}"
+            )
+            continue
+
+        underlying_price = _get_underlying_price(conn, symbol, snapshot_id)
+        if underlying_price is None:
+            continue
+
+        contracts = _get_options_for_symbol(conn, symbol, snapshot_id)
+        if not contracts:
+            continue
+
+        # Group by expiry, prefer monthly expirations (same logic as condors)
+        expiries: dict[tuple, list[dict]] = {}
+        for c in contracts:
+            key = (str(c["expiry"]), int(c["dte"]))
+            expiries.setdefault(key, []).append(c)
+
+        expiry_keys = sorted(expiries.keys())
+        monthly_keys = [
+            (exp, dte) for (exp, dte) in expiry_keys if _is_monthly_expiry(exp)
+        ]
+        if monthly_keys:
+            expiry_keys = monthly_keys
+
+        for (expiry, dte) in expiry_keys:
+            candidate = _build_strangle_for_expiry(
+                symbol              = symbol,
+                snapshot_id         = snapshot_id,
+                expiry              = expiry,
+                dte                 = dte,
+                contracts           = expiries[(expiry, dte)],
+                underlying_price    = underlying_price,
+                iv_rank             = iv_rank,
+                min_credit          = min_credit,
+                existing_strategies = open_strategies if open_strategies else None,
+            )
+            if candidate:
+                candidates.append(candidate)
+
+    logger.info(f"Strangle scan: {len(candidates)} candidates across {len(symbols)} symbols")
+    return candidates
+
+
 # ── Main scanner ──────────────────────────────────────────────────────────────
 def scan_for_candidates(
     symbols:     Optional[list[str]] = None,
     snapshot_id: Optional[int]       = None,
-) -> list[IronCondorCandidate]:
+) -> list[IronCondorCandidate | StrangleCandidate]:
     """
     Main entry point — scans the latest snapshot for iron condor candidates.
 
@@ -414,6 +657,8 @@ def scan_for_candidates(
 
         logger.info(f"Scanning snapshot_id={snapshot_id} for iron condor candidates")
 
+        open_positions = _get_open_positions_by_symbol(conn)
+
         # Use provided symbols or discover from snapshot
         if symbols is None:
             rows = conn.execute(text("""
@@ -430,6 +675,14 @@ def scan_for_candidates(
         logger.info(f"Scanning {len(symbols)} symbols: {symbols}")
 
         for symbol in symbols:
+
+            open_strategies = open_positions.get(symbol, [])
+
+            if "IRON_CONDOR" in open_strategies:
+                logger.info(
+                    f"{symbol}: skipping — already has open IRON_CONDOR position"
+                )
+                continue
 
             underlying_price = _get_underlying_price(conn, symbol, snapshot_id)
             if underlying_price is None:
@@ -475,13 +728,14 @@ def scan_for_candidates(
             for (expiry, dte) in expiry_keys:
                 expiry_contracts = expiries[(expiry, dte)]
                 candidate = _build_candidate_for_expiry(
-                    symbol           = symbol,
-                    snapshot_id      = snapshot_id,
-                    expiry           = expiry,
-                    dte              = dte,
-                    contracts        = expiry_contracts,
-                    underlying_price = underlying_price,
-                    iv_rank          = iv_rank,
+                    symbol              = symbol,
+                    snapshot_id         = snapshot_id,
+                    expiry              = expiry,
+                    dte                 = dte,
+                    contracts           = expiry_contracts,
+                    underlying_price    = underlying_price,
+                    iv_rank             = iv_rank,
+                    existing_strategies = open_strategies if open_strategies else None,
                 )
                 if candidate:
                     symbol_candidates.append(candidate)
@@ -491,6 +745,15 @@ def scan_for_candidates(
                 f"across {len(expiries)} expiries"
             )
             candidates.extend(symbol_candidates)
+
+        # Generate strangle candidates (additive — runs after condor loop)
+        strangle_candidates = generate_strangle_candidates(
+            conn            = conn,
+            symbols         = symbols,
+            snapshot_id     = snapshot_id,
+            open_positions  = open_positions,
+        )
+        candidates.extend(strangle_candidates)
 
     # Sort by closeness to IDEAL_DTE (38 days — middle of 30–45 sweet spot)
     candidates.sort(key=lambda c: abs(c.dte - IDEAL_DTE))

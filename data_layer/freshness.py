@@ -21,18 +21,45 @@ import os
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
+import pytz
+import pandas_market_calendars as mcal
 from sqlalchemy import create_engine, text
 
-from config import DB_HOST, DB_PORT, DB_NAME, DB_USER, DB_PASSWORD
+from config import DB_HOST, DB_PORT, DB_NAME, DB_USER, DB_PASSWORD, SCHWAB_TOKEN_PATH
+from data_layer.provider import get_schwab_client, AuthenticationRequiredError
 
 logger = logging.getLogger(__name__)
 
 DB_URL = f"postgresql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
 
+ET = pytz.timezone("America/New_York")
+NYSE = mcal.get_calendar("NYSE")
+
+
+def is_market_open() -> bool:
+    """
+    Returns True if the NYSE is currently open for regular trading.
+    Shared by main.py and approval_ui/api.py for refresh logic.
+    """
+    now_et = datetime.now(ET)
+    today = now_et.strftime("%Y-%m-%d")
+    try:
+        schedule_today = NYSE.schedule(start_date=today, end_date=today)
+        if schedule_today.empty:
+            return False
+        market_open = schedule_today.iloc[0]["market_open"].to_pydatetime()
+        market_close = schedule_today.iloc[0]["market_close"].to_pydatetime()
+        now_utc = datetime.now(timezone.utc)
+        return market_open <= now_utc <= market_close
+    except Exception as e:
+        logger.error(f"Market hours check failed — defaulting to closed: {e}")
+        return False
+
+
 # ── Thresholds ────────────────────────────────────────────────────────────────
 STALE_AFTER_MINUTES  = 20   # alert if most recent snapshot is older than this
 TOKEN_WARN_DAYS      = 2    # alert if token expires within this many days
-TOKEN_PATH           = Path(os.getenv("SCHWAB_TOKEN_PATH", "token.json"))
+TOKEN_PATH           = Path(SCHWAB_TOKEN_PATH or os.getenv("SCHWAB_TOKEN_PATH", "token.json"))
 
 
 # ── Check 1: Data Freshness ───────────────────────────────────────────────────
@@ -129,7 +156,7 @@ def check_token_expiry() -> dict:
             "expires_at":     None,
             "days_remaining": None,
             "message":        f"token.json not found at {TOKEN_PATH}. "
-                              f"Run: python -m data_layer.provider",
+                              f"Manual re-auth required: python -m data_layer.provider",
         }
 
     try:
@@ -159,7 +186,7 @@ def check_token_expiry() -> dict:
                 "status":         "expired",
                 "expires_at":     expires_at,
                 "days_remaining": round(days_remaining, 1),
-                "message":        "⚠ TOKEN EXPIRED — re-authenticate immediately: "
+                "message":        "⚠ TOKEN EXPIRED — manual re-auth required: "
                                   "python -m data_layer.provider",
             }
         elif days_remaining <= TOKEN_WARN_DAYS:
@@ -173,7 +200,7 @@ def check_token_expiry() -> dict:
                                   f"Re-authenticate soon: python -m data_layer.provider",
             }
         else:
-            return {
+            result = {
                 "ok":             True,
                 "status":         "valid",
                 "expires_at":     expires_at,
@@ -181,6 +208,23 @@ def check_token_expiry() -> dict:
                 "message":        f"Token valid — {round(days_remaining, 1)} days remaining "
                                   f"(expires {expires_at.strftime('%Y-%m-%d %H:%M UTC')})",
             }
+            # Extra signal: verify non-interactive client init won't prompt.
+            # This should be safe in unattended mode because interactive=False.
+            try:
+                get_schwab_client(interactive=False)
+                result["noninteractive_ok"] = True
+            except AuthenticationRequiredError:
+                result["noninteractive_ok"] = False
+                result["ok"] = False
+                result["status"] = "auth_required"
+                result["message"] = (
+                    "⚠ TOKEN REAUTH REQUIRED — Schwab token cannot be refreshed non-interactively. "
+                    "Run: python -m data_layer.provider"
+                )
+            except Exception:
+                # Don't fail health check on transient issues; just omit this signal.
+                result["noninteractive_ok"] = None
+            return result
 
     except Exception as e:
         return {

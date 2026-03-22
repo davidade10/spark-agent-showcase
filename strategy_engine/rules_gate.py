@@ -12,7 +12,7 @@ Rules enforced (in order of check):
   4. Position risk             — max loss must be ≤ 1% of account NAV
   5. Correlated risk           — combined risk on correlated underlyings ≤ 3% NAV
   6. Earnings proximity        — no new positions within 5 days of earnings
-  7. FOMC proximity            — no new positions within 2 days of FOMC
+  7. FOMC proximity            — no new positions within 1 days of FOMC
   8. Underlying volume         — underlying ADV must be ≥ 1,000,000 shares
   9. Daily loss kill switch    — block all new positions if account down ≥ 3% today
  10. Open interest             — both short strikes must have OI ≥ 100; block if unverifiable
@@ -28,14 +28,18 @@ from __future__ import annotations
 
 import json
 import logging
+import math
+import os
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Any, Optional, Tuple
 
 from sqlalchemy import create_engine, text
 
-from config import DB_HOST, DB_PORT, DB_NAME, DB_USER, DB_PASSWORD, HARD_RULES
+from config import DB_HOST, DB_PORT, DB_NAME, DB_USER, DB_PASSWORD, HARD_RULES, TRADING_MODE
 from data_layer.events_calendar import is_earnings_within_days, is_fomc_within_days
+from data_layer.notifier import send_telegram_msg
+from strategy_engine.candidates import IronCondorCandidate, StrangleCandidate
 from strategy_engine.scoring import ScoredCandidate
 
 logger = logging.getLogger(__name__)
@@ -176,7 +180,7 @@ def get_account_contexts(client) -> list[tuple[str, AccountContext]]:
         logger.error(f"Failed to fetch account contexts — {e}")
         return [("fallback", AccountContext(
             nav             = 0.0,
-            open_condors    = HARD_RULES["max_open_condors"],
+            open_condors    = HARD_RULES["max_open_condors_live"],
             daily_pnl_pct   = 0.0,
             open_symbols    = set(),
             correlated_risk = {},
@@ -208,12 +212,126 @@ def get_underlying_volume(client, symbol: str) -> Optional[float]:
 
 
 # ── Individual rule checks ────────────────────────────────────────────────────
-def _check_max_open_condors(ctx: AccountContext) -> Optional[str]:
-    """Returns failure reason string if rule fails, None if passes."""
-    if ctx.open_condors >= HARD_RULES["max_open_condors"]:
+def _check_max_open_condors(conn, account_id: str) -> Optional[str]:
+    """
+    Counts open IRON_CONDOR positions for this specific account in the DB.
+
+    PAPER accounts use max_open_condors_paper; any live account uses
+    max_open_condors_live.  Blocks when count >= limit (not strictly >).
+
+    Queries the positions table directly so PAPER positions (not reflected in
+    Schwab's API) are counted correctly and live/paper limits are independent.
+    """
+    is_paper = (account_id == "PAPER")
+    limit = (
+        HARD_RULES["max_open_condors_paper"]
+        if is_paper
+        else HARD_RULES["max_open_condors_live"]
+    )
+
+    row = conn.execute(text("""
+        SELECT COUNT(*) AS cnt
+        FROM positions
+        WHERE status     = 'open'
+          AND account_id = :account_id
+          AND strategy   = 'IRON_CONDOR'
+    """), {"account_id": account_id}).fetchone()
+
+    open_condors = int(row.cnt) if row else 0
+
+    if open_condors >= limit:
+        acct_label = "PAPER account" if is_paper else f"account {account_id}"
         return (
-            f"Already have {ctx.open_condors} open condors "
-            f"(max {HARD_RULES['max_open_condors']})"
+            f"{acct_label} has {open_condors} open condors (limit {limit})"
+        )
+    return None
+
+
+def _is_live_account_enabled(engine, gate_account_id: str) -> bool:
+    """
+    Returns True if live trading is enabled for this account.
+
+    Reads live_trading_enabled_{gate_account_id} from agent_config.
+    Fail-closed: missing key, non-'true' value, or DB error → False.
+
+    Only called for non-PAPER accounts. PAPER is always allowed through
+    this check (controlled separately by TRADING_MODE).
+    """
+    key = f"live_trading_enabled_{gate_account_id}"
+    try:
+        with engine.connect() as conn:
+            row = conn.execute(text(
+                "SELECT value FROM agent_config WHERE key = :key"
+            ), {"key": key}).fetchone()
+        if row is None:
+            logger.info(
+                f"_is_live_account_enabled: key '{key}' not found in agent_config — "
+                f"treating account {gate_account_id} as disabled"
+            )
+            return False
+        enabled = str(row[0]).lower().strip() in ("true", "1", "yes")
+        if not enabled:
+            logger.info(
+                f"_is_live_account_enabled: '{key}' = {row[0]!r} — "
+                f"account {gate_account_id} is not enabled for live trading"
+            )
+        return enabled
+    except Exception as e:
+        logger.warning(
+            f"_is_live_account_enabled: DB error reading '{key}' — "
+            f"treating account {gate_account_id} as disabled. Error: {e}"
+        )
+        return False
+
+
+def _check_strangle_trading_enabled(conn) -> Optional[str]:
+    """
+    Reads strangle_trading_enabled from agent_config.
+    Returns a block reason if the value is not 'true'; None if enabled.
+    Fail-closed: any DB error or missing key → blocked.
+    """
+    try:
+        row = conn.execute(text("""
+            SELECT value FROM agent_config WHERE key = 'strangle_trading_enabled'
+        """)).fetchone()
+        if row is None:
+            return "Strangle trading is disabled (config key not found — defaulting to disabled)"
+        if str(row[0]).lower().strip() not in ("true", "1", "yes"):
+            return "Strangle trading is disabled — set strangle_trading_enabled=true to enable"
+    except Exception as e:
+        logger.warning(f"_check_strangle_trading_enabled: DB error — {e}")
+        return "Strangle trading check failed — defaulting to disabled"
+    return None
+
+
+def _check_max_open_strangles(conn, account_id: str) -> Optional[str]:
+    """
+    Counts open STRANGLE positions for this account.
+    Limits are separate from the condor limit (strangles carry unlimited risk).
+    Uses HARD_RULES keys max_open_strangles_paper / max_open_strangles_live
+    with fallbacks of 4 (paper) and 2 (live).
+    """
+    is_paper = (account_id == "PAPER")
+    limit = (
+        HARD_RULES.get("max_open_strangles_paper", 4)
+        if is_paper
+        else HARD_RULES.get("max_open_strangles_live", 2)
+    )
+
+    row = conn.execute(text("""
+        SELECT COUNT(*) AS cnt
+        FROM positions
+        WHERE status     = 'open'
+          AND account_id = :account_id
+          AND strategy   = 'STRANGLE'
+    """), {"account_id": account_id}).fetchone()
+
+    open_strangles = int(row.cnt) if row else 0
+
+    if open_strangles >= limit:
+        acct_label = "PAPER account" if is_paper else f"account {account_id}"
+        return (
+            f"{acct_label} has {open_strangles} open strangles (limit {limit})"
         )
     return None
 
@@ -250,16 +368,26 @@ def _check_position_risk(
     ctx:    AccountContext,
 ) -> Optional[str]:
     """
-    Checks that max loss on this trade doesn't exceed 1% of NAV.
+    Checks that max loss on this trade doesn't exceed 6% of NAV.  <-- CHANGE THIS
     Max loss per contract = spread_width - net_credit (per share × 100).
     We assume 1 contract (100 shares) as the default position size.
     """
     if ctx.nav <= 0:
         return "Cannot verify position risk — NAV unavailable"
 
-    max_loss_dollars = scored.candidate.max_loss * 100  # per contract
+    max_loss = getattr(scored.candidate, "max_loss", None)
+    if max_loss is None:
+        logger.warning(
+            f"{scored.candidate.symbol}: max_loss undefined "
+            f"(strategy={getattr(scored.candidate, 'strategy', 'unknown')}) "
+            f"— skipping position_risk check"
+        )
+        return None
+
+    max_loss_dollars = max_loss * 100  # per contract
     risk_pct         = max_loss_dollars / ctx.nav
 
+    # This logic is already correct because it pulls 0.06 from config.py
     if risk_pct > HARD_RULES["max_position_risk_pct"]:
         return (
             f"Position risk {risk_pct:.2%} exceeds "
@@ -267,7 +395,6 @@ def _check_position_risk(
             f"(max loss ${max_loss_dollars:.0f} on NAV ${ctx.nav:,.0f})"
         )
     return None
-
 
 def _check_correlated_risk(
     scored: ScoredCandidate,
@@ -283,8 +410,16 @@ def _check_correlated_risk(
     symbol = scored.candidate.symbol
     group  = CORRELATION_GROUPS.get(symbol, symbol)
 
+    max_loss = getattr(scored.candidate, "max_loss", None)
+    if max_loss is None:
+        logger.warning(
+            f"{scored.candidate.symbol}: max_loss undefined "
+            f"— skipping correlated_risk check"
+        )
+        return None
+
     existing_risk    = ctx.correlated_risk.get(group, 0.0)
-    new_risk_dollars = scored.candidate.max_loss * 100
+    new_risk_dollars = max_loss * 100
     total_risk       = existing_risk + new_risk_dollars
     total_risk_pct   = total_risk / ctx.nav
 
@@ -438,6 +573,126 @@ def _check_daily_loss_kill(ctx: AccountContext) -> Optional[str]:
     return None
 
 
+def _blocked_numeric_extras(
+    rule_name:        str,
+    scored:           ScoredCandidate,
+    ctx:              AccountContext,
+    conn,
+    gate_account_id:  str,
+    client,
+) -> Tuple[Optional[float], Optional[float], Optional[str]]:
+    """
+    Optional (actual, threshold, operator) for blocked_reason JSONB.
+    operator describes the pass condition; failure means actual violates it.
+    Boolean / proximity rules return (None, None, None).
+    """
+    c = scored.candidate
+
+    if rule_name == "net_credit":
+        return (
+            float(c.net_credit),
+            float(HARD_RULES["min_net_credit"]),
+            ">=",
+        )
+
+    if rule_name == "short_delta":
+        put_d = abs(c.short_put_delta)
+        call_d = abs(c.short_call_delta)
+        th = float(HARD_RULES["max_short_delta"])
+        if put_d > th:
+            return (put_d, th, "<=")
+        if call_d > th:
+            return (call_d, th, "<=")
+        return (None, None, None)
+
+    if rule_name == "position_risk":
+        if ctx.nav <= 0:
+            return (None, None, None)
+        _max_loss = getattr(c, "max_loss", None)
+        if _max_loss is None:
+            return (None, None, None)
+        max_loss_d = _max_loss * 100
+        risk_pct = max_loss_d / ctx.nav
+        return (risk_pct, float(HARD_RULES["max_position_risk_pct"]), "<=")
+
+    if rule_name == "correlated_risk":
+        if ctx.nav <= 0:
+            return (None, None, None)
+        _max_loss = getattr(c, "max_loss", None)
+        if _max_loss is None:
+            return (None, None, None)
+        symbol = c.symbol
+        group = CORRELATION_GROUPS.get(symbol, symbol)
+        existing = ctx.correlated_risk.get(group, 0.0)
+        new_risk = _max_loss * 100
+        total_risk = existing + new_risk
+        total_risk_pct = total_risk / ctx.nav
+        return (total_risk_pct, float(HARD_RULES["max_correlated_risk_pct"]), "<=")
+
+    if rule_name == "underlying_volume":
+        volume = get_underlying_volume(client, c.symbol)
+        if volume is None:
+            return (None, None, None)
+        return (float(volume), float(HARD_RULES["min_underlying_adv"]), ">=")
+
+    if rule_name == "max_open_condors":
+        is_paper = gate_account_id == "PAPER"
+        limit = (
+            HARD_RULES["max_open_condors_paper"]
+            if is_paper
+            else HARD_RULES["max_open_condors_live"]
+        )
+        row = conn.execute(text("""
+            SELECT COUNT(*) AS cnt
+            FROM positions
+            WHERE status     = 'open'
+              AND account_id = :account_id
+              AND strategy   = 'IRON_CONDOR'
+        """), {"account_id": gate_account_id}).fetchone()
+        cnt = int(row.cnt) if row else 0
+        return (float(cnt), float(limit), ">=")
+
+    if rule_name == "open_interest":
+        min_oi = float(HARD_RULES["min_short_strike_oi"])
+        put_oi, call_oi = _get_short_strike_oi(conn, scored)
+        if put_oi is not None and put_oi < min_oi:
+            return (float(put_oi), min_oi, ">=")
+        if call_oi is not None and call_oi < min_oi:
+            return (float(call_oi), min_oi, ">=")
+        return (None, None, None)
+
+    # earnings_proximity, fomc_proximity, daily_loss_kill, rule errors → boolean / non-numeric
+    return (None, None, None)
+
+
+def _resolve_qty_for_candidate_json(c: Any) -> Optional[int]:
+    """
+    Integer qty (contracts per leg) for candidate_json, or None if unknown.
+
+    IronCondorCandidate always persists a positive int: field default is 1, and
+    pre-qty legacy instances (attr missing on instance) fall back to 1.
+    Other objects use qty / contracts / position_size only when set.
+    """
+    if isinstance(c, IronCondorCandidate):
+        try:
+            v = int(getattr(c, "qty", 1))
+        except (TypeError, ValueError):
+            v = 1
+        return v if v > 0 else 1
+
+    for attr in ("qty", "contracts", "position_size"):
+        raw = getattr(c, attr, None)
+        if raw is None:
+            continue
+        try:
+            qf = float(raw)
+            if not math.isnan(qf) and not math.isinf(qf) and qf >= 0:
+                return int(round(qf))
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
 # ── Database writer ───────────────────────────────────────────────────────────
 def _write_to_trade_candidates(
     conn,
@@ -445,6 +700,10 @@ def _write_to_trade_candidates(
     gate_result:     str,
     blocking_rule:   Optional[str],
     blocking_reason: Optional[str],
+    account_id:      str = "PAPER",
+    block_actual:    Optional[float] = None,
+    block_threshold: Optional[float] = None,
+    block_operator:  Optional[str] = None,
 ) -> int:
     """
     Writes the candidate and gate result to trade_candidates table.
@@ -455,22 +714,45 @@ def _write_to_trade_candidates(
     """
     c = scored.candidate
 
+    _qty_out = _resolve_qty_for_candidate_json(c)
+
     candidate_json = {
         "symbol":             c.symbol,
         "expiry":             c.expiry,
         "dte":                c.dte,
-        "long_put_strike":    c.long_put_strike,
         "short_put_strike":   c.short_put_strike,
         "short_call_strike":  c.short_call_strike,
-        "long_call_strike":   c.long_call_strike,
         "net_credit":         c.net_credit,
-        "spread_width":       c.spread_width,
-        "max_loss":           c.max_loss,
         "underlying_price":   c.underlying_price,
         "iv_rank":            c.iv_rank,
         "short_put_delta":    c.short_put_delta,
         "short_call_delta":   c.short_call_delta,
+        # Condor-specific (None for strangles):
+        "long_put_strike":    getattr(c, "long_put_strike",  None),
+        "long_call_strike":   getattr(c, "long_call_strike", None),
+        "spread_width":       getattr(c, "spread_width",     None),
+        "max_loss":           getattr(c, "max_loss",         None),
+        # Strangle-specific (None for condors):
+        "short_put_credit":   getattr(c, "short_put_credit",  None),
+        "short_call_credit":  getattr(c, "short_call_credit", None),
     }
+    if _qty_out is not None:
+        candidate_json["qty"] = _qty_out
+
+    logger.debug(
+        "trade_candidates_write sym=%s gate=%s acct=%s scored_t=%s cand_t=%s "
+        "qty_attr=%r contracts=%r pos_sz=%r resolved=%r json_has_qty=%s",
+        c.symbol,
+        gate_result,
+        account_id,
+        type(scored).__name__,
+        type(c).__name__,
+        getattr(c, "qty", None),
+        getattr(c, "contracts", None),
+        getattr(c, "position_size", None),
+        _qty_out,
+        "qty" in candidate_json,
+    )
 
     score_json = {
         "total_score":        scored.total_score,
@@ -478,10 +760,28 @@ def _write_to_trade_candidates(
         "credit_width_score": scored.credit_width_score,
         "delta_score":        scored.delta_score,
         "dte_score":          scored.dte_score,
+        "call_delta_score":   scored.call_delta_score,
         "score_notes":        scored.score_notes,
         "blocking_rule":      blocking_rule,
         "blocking_reason":    blocking_reason,
     }
+
+    # Construct blocked_reason JSONB — populated only when gate_result='blocked'.
+    # Kept as a dedicated column so GET /shadow can query it directly without
+    # parsing llm_card. None is stored as SQL NULL for approved candidates.
+    blocked_reason_json: Optional[str] = None
+    if blocking_rule:
+        payload: dict[str, Any] = {
+            "rule":   blocking_rule,
+            "detail": blocking_reason or "",
+        }
+        if block_actual is not None or block_threshold is not None or block_operator:
+            payload["actual"] = block_actual
+            payload["threshold"] = block_threshold
+            payload["operator"] = block_operator
+        blocked_reason_json = json.dumps(payload)
+
+    _strategy_col = getattr(c, "strategy", "iron_condor").lower()
 
     result = conn.execute(text("""
         INSERT INTO trade_candidates (
@@ -493,27 +793,32 @@ def _write_to_trade_candidates(
             candidate_json,
             llm_card,
             gate_result,
-            account_id
+            account_id,
+            blocked_reason
         ) VALUES (
             :created_at,
             :snapshot_id,
             :symbol,
-            'iron_condor',
+            :strategy,
             :score,
             :candidate_json,
             :score_json,
             :gate_result,
-            'primary'
+            :account_id,
+            cast(:blocked_reason as jsonb)
         )
         RETURNING id
     """), {
         "created_at":      datetime.now(timezone.utc),
         "snapshot_id":     c.snapshot_id,
         "symbol":          c.symbol,
+        "strategy":        _strategy_col,
         "score":           scored.total_score,
         "candidate_json":  json.dumps(candidate_json),
         "score_json":      json.dumps(score_json),
         "gate_result":     gate_result,
+        "account_id":      account_id,
+        "blocked_reason":  blocked_reason_json,
     })
 
     conn.commit()
@@ -537,10 +842,73 @@ def run_gate(
     engine           = create_engine(DB_URL)
     all_results: dict[str, list[GateResult]] = {}
 
+    # Retire old visible pending before inserting new batch (prevents stale cards in UI)
+    with engine.begin() as conn:
+        result = conn.execute(text("""
+            UPDATE trade_candidates
+            SET llm_card = jsonb_set(
+                COALESCE(llm_card, '{}'::jsonb),
+                '{approval_status}',
+                '"stale"',
+                true
+            )
+            WHERE gate_result = 'approved'
+              AND (llm_card IS NOT NULL AND llm_card != '{}'::jsonb)
+              AND (llm_card ? 'recommendation')
+              AND COALESCE(llm_card->>'approval_status', '') NOT IN ('approved', 'working')
+        """))
+        retired = result.rowcount
+    if retired:
+        logger.info(f"Retired {retired} stale pending trade cards before inserting new batch")
+
     logger.info("Fetching account contexts from Schwab...")
     account_contexts = get_account_contexts(client)
 
+    # In paper mode the only relevant account is PAPER.  Schwab's API only
+    # returns real brokerage accounts; PAPER positions live exclusively in
+    # the DB.  Replace the Schwab-derived list so the gate loop evaluates
+    # PAPER once — with the correct NAV and condor limit — instead of
+    # iterating live accounts with a hard-coded "PAPER" gate_account_id.
+    if TRADING_MODE == "paper":
+        paper_nav = float(os.getenv("PAPER_ACCOUNT_NAV", "20000"))
+        account_contexts = [("PAPER", AccountContext(
+            nav             = paper_nav,
+            open_condors    = 0,
+            daily_pnl_pct   = 0.0,
+            open_symbols    = set(),
+            correlated_risk = {},
+        ))]
+        logger.info(f"Paper mode: evaluating PAPER account only (NAV=${paper_nav:,.2f})")
+
     for account_label, ctx in account_contexts:
+        # Derive the account_id used for DB queries and limit selection.
+        #
+        # TRADING_MODE='paper' takes priority: PAPER positions live only in the DB
+        # (not in any Schwab account context), so we must check account_id='PAPER'.
+        #
+        # For live accounts, account_label is "...XXXX" (last-4 of account number).
+        # Stripping leading dots yields the exact account_id stored in positions.
+        #
+        # "fallback" is the error label returned by get_account_contexts() when
+        # Schwab auth fails; other gate checks (nav=0) block trades in that case.
+        if TRADING_MODE == "paper":
+            gate_account_id = "PAPER"
+        elif account_label.startswith("..."):
+            gate_account_id = account_label.lstrip(".")
+        else:
+            gate_account_id = account_label  # "fallback" or unexpected value
+
+        # Per-account live enable check.
+        # PAPER always proceeds — it is controlled by TRADING_MODE, not this flag.
+        # For every live account, live_trading_enabled_{suffix} must be 'true'
+        # in agent_config or the gate skips this account entirely.
+        if gate_account_id != "PAPER" and not _is_live_account_enabled(engine, gate_account_id):
+            logger.info(
+                f"Gate: skipping account {gate_account_id} — "
+                f"live_trading_enabled_{gate_account_id} is not set to 'true'"
+            )
+            continue
+
         logger.info(f"\n── Running gate for account {account_label} ──────────")
         results = []
 
@@ -550,18 +918,34 @@ def run_gate(
                 blocking_rule   = None
                 blocking_reason = None
 
-                checks = [
-                    ("max_open_condors",   lambda: _check_max_open_condors(ctx)),
-                    ("daily_loss_kill",    lambda: _check_daily_loss_kill(ctx)),
-                    ("net_credit",         lambda: _check_net_credit(scored)),
-                    ("short_delta",        lambda: _check_short_delta(scored)),
-                    ("fomc_proximity",     lambda: _check_fomc_proximity()),
-                    ("earnings_proximity", lambda: _check_earnings_proximity(scored)),
-                    ("position_risk",      lambda: _check_position_risk(scored, ctx)),
-                    ("correlated_risk",    lambda: _check_correlated_risk(scored, ctx)),
-                    ("underlying_volume",  lambda: _check_underlying_volume(scored, client)),
-                    ("open_interest",      lambda: _check_open_interest(scored, conn)),
-                ]
+                if isinstance(scored.candidate, StrangleCandidate):
+                    # Strangle gate: no position_risk / correlated_risk (unlimited max loss).
+                    # strangle_trading_disabled is checked first — if disabled, all strangles
+                    # are blocked immediately and recorded in /shadow for monitoring.
+                    checks = [
+                        ("strangle_trading_disabled", lambda: _check_strangle_trading_enabled(conn)),
+                        ("max_open_strangles", lambda: _check_max_open_strangles(conn, gate_account_id)),
+                        ("daily_loss_kill",    lambda: _check_daily_loss_kill(ctx)),
+                        ("net_credit",         lambda: _check_net_credit(scored)),
+                        ("short_delta",        lambda: _check_short_delta(scored)),
+                        ("fomc_proximity",     lambda: _check_fomc_proximity()),
+                        ("earnings_proximity", lambda: _check_earnings_proximity(scored)),
+                        ("underlying_volume",  lambda: _check_underlying_volume(scored, client)),
+                        ("open_interest",      lambda: _check_open_interest(scored, conn)),
+                    ]
+                else:
+                    checks = [
+                        ("max_open_condors",   lambda: _check_max_open_condors(conn, gate_account_id)),
+                        ("daily_loss_kill",    lambda: _check_daily_loss_kill(ctx)),
+                        ("net_credit",         lambda: _check_net_credit(scored)),
+                        ("short_delta",        lambda: _check_short_delta(scored)),
+                        ("fomc_proximity",     lambda: _check_fomc_proximity()),
+                        ("earnings_proximity", lambda: _check_earnings_proximity(scored)),
+                        ("position_risk",      lambda: _check_position_risk(scored, ctx)),
+                        ("correlated_risk",    lambda: _check_correlated_risk(scored, ctx)),
+                        ("underlying_volume",  lambda: _check_underlying_volume(scored, client)),
+                        ("open_interest",      lambda: _check_open_interest(scored, conn)),
+                    ]
 
                 for rule_name, check_fn in checks:
                     try:
@@ -593,16 +977,27 @@ def run_gate(
                         f"— {blocking_rule}: {blocking_reason}"
                     )
 
-                # Dedup: skip if this symbol/expiry already has a row
+                # Dedup: skip if this symbol/expiry/gate_result was already
+                # written within the last 2 hours.
+                #
+                # Scope dedup by gate_result so an approved row from a prior
+                # run never suppresses a blocked write (or vice versa), and
+                # the 2-hour window prevents stale rows from days/weeks ago
+                # from blocking fresh writes after conditions have changed.
                 try:
                     existing = conn.execute(text("""
                         SELECT id FROM trade_candidates
                         WHERE symbol = :symbol
                           AND candidate_json->>'expiry' = :expiry
+                          AND gate_result = :gate_result
+                          AND account_id  = :account_id
+                          AND created_at >= NOW() - INTERVAL '2 hours'
                         LIMIT 1
                     """), {
-                        "symbol": symbol,
-                        "expiry": scored.candidate.expiry,
+                        "symbol":      symbol,
+                        "expiry":      scored.candidate.expiry,
+                        "gate_result": gate_result,
+                        "account_id":  gate_account_id,
                     }).fetchone()
                 except Exception as e:
                     logger.warning(f"{symbol}: dedup check failed — {e}")
@@ -616,9 +1011,51 @@ def run_gate(
                     candidate_id = existing[0]
                 else:
                     try:
+                        ba, bt, bo = (None, None, None)
+                        if blocking_rule:
+                            ba, bt, bo = _blocked_numeric_extras(
+                                blocking_rule,
+                                scored,
+                                ctx,
+                                conn,
+                                gate_account_id,
+                                client,
+                            )
                         candidate_id = _write_to_trade_candidates(
-                            conn, scored, gate_result, blocking_rule, blocking_reason
+                            conn,
+                            scored,
+                            gate_result,
+                            blocking_rule,
+                            blocking_reason,
+                            account_id=gate_account_id,
+                            block_actual=ba,
+                            block_threshold=bt,
+                            block_operator=bo,
                         )
+                        if passed and candidate_id is not None:
+                            try:
+                                from datetime import date as _date
+                                _c          = scored.candidate
+                                _exp        = _date.fromisoformat(_c.expiry)
+                                _expiry_fmt = f"{_exp.strftime('%b')} {_exp.day}"
+                                _contracts  = (
+                                    " · paper contracts"
+                                    if gate_account_id == "PAPER"
+                                    else ""
+                                )
+                                _msg = (
+                                    f"🔥 *TRADE APPROVED* — {symbol} | {gate_account_id}\n"
+                                    f"{_expiry_fmt}{_contracts}\n"
+                                    f"${_c.long_put_strike:g}P / ${_c.short_put_strike:g}P"
+                                    f" — ${_c.short_call_strike:g}C / ${_c.long_call_strike:g}C\n"
+                                    f"Credit: ${_c.net_credit:.2f} | Score: {scored.total_score:.1f}\n"
+                                    f"→ Check UI to execute"
+                                )
+                                send_telegram_msg(_msg)
+                            except Exception as tg_exc:
+                                logger.warning(
+                                    f"{symbol}: approval Telegram notification failed — {tg_exc}"
+                                )
                     except Exception as e:
                         logger.error(f"{symbol}: failed to write to trade_candidates — {e}")
                         candidate_id = None
