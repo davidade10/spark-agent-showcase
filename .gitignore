@@ -8,3 +8,18 @@ pgdata/
 llm_layer/circuit_breaker_state.json
 node_modules/
 logs/
+
+# local/private/runtime
+.env
+token.json
+*.log
+logs/
+.openclaw/
+sessions/
+*.jsonl
+
+# python/cache
+__pycache__/
+.pytest_cache/
+
+Claude.md

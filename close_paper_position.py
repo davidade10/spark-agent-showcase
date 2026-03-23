@@ -34,12 +34,17 @@ logger = logging.getLogger(__name__)
 
 # ── DB connection ─────────────────────────────────────────────────────────────
 import os
+from datetime import datetime, timezone
+from typing import Optional
+
 from dotenv import load_dotenv
+from sqlalchemy import create_engine, text
+
 load_dotenv()
 
 DB_URL = "postgresql://{user}:{pw}@{host}:{port}/{db}".format(
     user=os.getenv("DB_USER", "postgres"),
-    pw=os.getenv("DB_PASSWORD", "Ayomikun123"),
+    pw=os.getenv("DB_PASSWORD", "REDACTED"),
     host=os.getenv("DB_HOST", "localhost"),
     port=os.getenv("DB_PORT", "5432"),
     db=os.getenv("DB_NAME", "postgres"),
